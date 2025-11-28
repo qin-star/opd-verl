@@ -254,6 +254,9 @@ class RLHFDataset(Dataset):
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}
+        
+        # Extract teacher_response if present (for GAD training)
+        teacher_response = row_dict.pop("teacher_response", None)
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
@@ -396,6 +399,41 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        
+        # Process teacher_response if present (for GAD training)
+        if teacher_response is not None:
+            # Tokenize teacher response
+            teacher_response_tokens = self.tokenizer(teacher_response, return_tensors="pt", add_special_tokens=False)
+            teacher_response_ids = teacher_response_tokens["input_ids"]
+            
+            # Postprocess teacher response
+            teacher_response_ids, _ = verl_F.postprocess_data(
+                input_ids=teacher_response_ids,
+                max_length=self.max_response_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=False,  # Right pad for responses
+                truncation=self.truncation,
+            )
+            
+            # Construct teacher_input_ids = prompt + teacher_response
+            prompt_ids = row_dict["input_ids"]
+            teacher_input_ids = torch.cat([prompt_ids.unsqueeze(0), teacher_response_ids], dim=1)
+            
+            # Create attention mask for teacher
+            teacher_attention_mask = (teacher_input_ids != self.tokenizer.pad_token_id).long()
+            
+            # Create position ids for teacher
+            if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+                # For vision models, extend position_ids
+                teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+            else:
+                teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+            
+            row_dict["teacher_response"] = teacher_response_ids[0]
+            row_dict["teacher_input_ids"] = teacher_input_ids[0]
+            row_dict["teacher_attention_mask"] = teacher_attention_mask[0]
+            row_dict["teacher_position_ids"] = teacher_position_ids[0]
+        
         return row_dict
 
     def __getstate__(self):

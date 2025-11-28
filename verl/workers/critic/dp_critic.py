@@ -50,8 +50,13 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch):
-        response_length = micro_batch["responses"].size(-1)
+    def _forward_micro_batch(self, micro_batch, compute_teacher=False):
+        # Determine which data to use based on compute_teacher flag
+        if compute_teacher:
+            response_length = micro_batch["teacher_response"].size(-1)
+        else:
+            response_length = micro_batch["responses"].size(-1)
+        
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -59,10 +64,16 @@ class DataParallelPPOCritic(BasePPOCritic):
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            input_ids = micro_batch["input_ids"]
-            batch, seqlen = input_ids.shape
-            attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
+            if compute_teacher:
+                input_ids = micro_batch["teacher_input_ids"]
+                batch, seqlen = input_ids.shape
+                attention_mask = micro_batch["teacher_attention_mask"]
+                position_ids = micro_batch["teacher_position_ids"]
+            else:
+                input_ids = micro_batch["input_ids"]
+                batch, seqlen = input_ids.shape
+                attention_mask = micro_batch["attention_mask"]
+                position_ids = micro_batch["position_ids"]
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)
 
@@ -114,7 +125,17 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 # pad it back
                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
-                values = values[:, -response_length - 1 : -1]
+                # For sequence-level reward model: extract current token values
+                values = values[:, -response_length:]
+                
+                # Apply last token mask for sequence-level scoring
+                response_mask = attention_mask[:, -response_length:]
+                response_lengths = response_mask.sum(dim=1).long()
+                last_token_indices = response_lengths - 1
+                last_token_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+                batch_indices = torch.arange(response_mask.size(0), device=response_mask.device)
+                last_token_mask[batch_indices, last_token_indices] = True
+                values = values * last_token_mask.type_as(values)
             else:
                 output = self.critic_module(
                     input_ids=input_ids,
@@ -128,8 +149,46 @@ class DataParallelPPOCritic(BasePPOCritic):
                     values = output[2]
                 else:
                     values = output.logits
-                values = values[:, -response_length - 1 : -1].squeeze(-1)
+                # For sequence-level reward model: extract current token values
+                values = values[:, -response_length:].squeeze(-1)
+                
+                # Apply last token mask for sequence-level scoring
+                response_mask = attention_mask[:, -response_length:]
+                response_lengths = response_mask.sum(dim=1).long()
+                last_token_indices = response_lengths - 1
+                last_token_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+                batch_indices = torch.arange(response_mask.size(0), device=response_mask.device)
+                last_token_mask[batch_indices, last_token_indices] = True
+                values = values * last_token_mask.type_as(values)
             return values
+
+    def _forward_batch_teacher_forcing_grpo(self, batch, teacher_repeat):
+        """
+        Teacher forcing for GRPO: assign incremental values to teacher responses in the same group.
+        
+        Args:
+            batch: Batch containing teacher data
+            teacher_repeat: Number of teacher responses per prompt
+        
+        Returns:
+            values: Tensor with teacher forcing values
+        """
+        response_length = batch["teacher_response"].size(-1)
+        input_ids = batch["teacher_input_ids"]
+        bsz, seqlen = input_ids.shape
+        attention_mask = batch["teacher_attention_mask"]
+        
+        values = torch.zeros((bsz, response_length), device=input_ids.device)
+        response_mask = attention_mask[:, -response_length:]
+        response_lengths = response_mask.sum(dim=1).long()
+        last_token_indices = response_lengths - 1
+        
+        # Assign incremental values for teacher responses in the same group
+        for i in range(0, bsz, teacher_repeat):
+            for j in range(teacher_repeat):
+                values[i + j, last_token_indices[i + j]] = float(j)
+        
+        return values
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -151,16 +210,30 @@ class DataParallelPPOCritic(BasePPOCritic):
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def compute_values(self, data: DataProto) -> torch.Tensor:
+        # Check if computing teacher values
+        compute_teacher = data.meta_info.get("compute_teacher", False)
+        
         self.critic_module.eval()
         micro_batch_size = data.meta_info["micro_batch_size"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = (
-            ["responses", "input_ids", "response_mask", "attention_mask", "position_ids"]
-            if "response_mask" in data.batch
-            else ["responses", "input_ids", "attention_mask", "position_ids"]
-        )
+        
+        # Select keys based on compute_teacher flag
+        if compute_teacher:
+            select_keys = ["teacher_response", "teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"]
+        else:
+            select_keys = (
+                ["responses", "input_ids", "response_mask", "attention_mask", "position_ids"]
+                if "response_mask" in data.batch
+                else ["responses", "input_ids", "attention_mask", "position_ids"]
+            )
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        
+        # Teacher forcing for GRPO
+        if compute_teacher and "teacher_repeat" in data.meta_info:
+            teacher_repeat = data.meta_info["teacher_repeat"]
+            batch = data.select(batch_keys=select_keys).batch
+            return self._forward_batch_teacher_forcing_grpo(batch, teacher_repeat=teacher_repeat)
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -175,17 +248,27 @@ class DataParallelPPOCritic(BasePPOCritic):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                values = self._forward_micro_batch(model_inputs)
+                values = self._forward_micro_batch(model_inputs, compute_teacher=compute_teacher)
             values_lst.append(values)
         values = torch.concat(values_lst, dim=0)
 
         if use_dynamic_bsz:
             values = restore_dynamic_batch(values, batch_idx_list)
 
-        if "response_mask" in data.batch:
+        # Apply response mask (already applied in _forward_micro_batch for GAD mode)
+        if not compute_teacher and "response_mask" in data.batch:
             response_mask = data.batch["response_mask"]
             response_mask = response_mask.to(values.device)
             values = values * response_mask  # Only action tokens have values
+        elif compute_teacher:
+            # For teacher values, apply teacher response mask
+            responses = data.batch.get("teacher_response")
+            if responses is not None:
+                attention_mask = data.batch.get("teacher_attention_mask")
+                if attention_mask is not None:
+                    response_length = responses.size(1)
+                    response_mask = attention_mask[:, -response_length:]
+                    values = values * response_mask
         return values
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
@@ -193,8 +276,20 @@ class DataParallelPPOCritic(BasePPOCritic):
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
+        
+        # Check if using GAD discriminator training
+        use_discriminator = "teacher_response" in data.batch
 
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        if use_discriminator:
+            # GAD mode: need both student and teacher data
+            select_keys = [
+                "input_ids", "responses", "attention_mask", "position_ids",
+                "teacher_input_ids", "teacher_response", "teacher_attention_mask", "teacher_position_ids"
+            ]
+        else:
+            # Standard PPO mode: only need student data and returns
+            select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -221,36 +316,82 @@ class DataParallelPPOCritic(BasePPOCritic):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
-                    values = model_inputs["values"]
-                    returns = model_inputs["returns"]
-
-                    vpreds = self._forward_micro_batch(model_inputs)
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        response_mask=response_mask,
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
-                    )
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                        loss = vf_loss * loss_scale_factor
+                    
+                    if use_discriminator:
+                        # GAD discriminator training
+                        responses = model_inputs["responses"]
+                        attention_mask = model_inputs["attention_mask"]
+                        response_length = responses.size(1)
+                        response_mask = attention_mask[:, -response_length:]
+                        
+                        teacher_response = model_inputs["teacher_response"]
+                        teacher_attention_mask = model_inputs["teacher_attention_mask"]
+                        teacher_response_length = teacher_response.size(1)
+                        teacher_response_mask = teacher_attention_mask[:, -teacher_response_length:]
+                        
+                        # Dual forward pass
+                        student_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
+                        teacher_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=True)
+                        
+                        # Compute discriminator accuracy
+                        d_acc = (teacher_vpreds.sum(dim=-1) > student_vpreds.sum(dim=-1)).float().mean()
+                        
+                        # Compute discriminator loss
+                        d_loss = core_algos.compute_discriminator_loss(
+                            student_vpreds=student_vpreds,
+                            teacher_vpreds=teacher_vpreds,
+                            response_mask=response_mask,
+                            teacher_response_mask=teacher_response_mask,
+                        )
+                        
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                            loss = d_loss * loss_scale_factor
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+                            loss = d_loss * loss_scale_factor
+                        
+                        loss.backward()
+                        
+                        micro_batch_metrics.update(
+                            {
+                                "critic/d_loss": d_loss.detach().item(),
+                                "critic/d_acc": d_acc.detach().item(),
+                                "critic/student_value_mean": (student_vpreds * response_mask).sum(dim=-1).mean().detach().item(),
+                                "critic/teacher_value_mean": (teacher_vpreds * teacher_response_mask).sum(dim=-1).mean().detach().item(),
+                            }
+                        )
                     else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
-                        loss = vf_loss * loss_scale_factor
+                        # Standard PPO value function training
+                        response_mask = model_inputs["response_mask"]
+                        values = model_inputs["values"]
+                        returns = model_inputs["returns"]
 
-                    loss.backward()
+                        vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
+                        vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                            vpreds=vpreds,
+                            values=values,
+                            returns=returns,
+                            response_mask=response_mask,
+                            cliprange_value=self.config.cliprange_value,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                        )
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                            loss = vf_loss * loss_scale_factor
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+                            loss = vf_loss * loss_scale_factor
 
-                    micro_batch_metrics.update(
-                        {
-                            "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
-                            "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
-                        }
-                    )
+                        loss.backward()
+
+                        micro_batch_metrics.update(
+                            {
+                                "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
+                                "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+                                "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                            }
+                        )
 
                     append_to_dict(metrics, micro_batch_metrics)
 

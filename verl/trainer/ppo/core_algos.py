@@ -1391,6 +1391,43 @@ def compute_value_loss(
     return vf_loss, vf_clipfrac
 
 
+def compute_discriminator_loss(
+    student_vpreds: torch.Tensor,
+    teacher_vpreds: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute discriminator loss for GAD training.
+    
+    The discriminator is trained to give higher scores to teacher responses
+    than student responses using a binary cross-entropy style loss.
+    
+    Args:
+        student_vpreds (torch.Tensor):
+            Value predictions for student responses, shape (batch_size, response_length).
+        teacher_vpreds (torch.Tensor):
+            Value predictions for teacher responses, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask for student responses, shape (batch_size, response_length).
+        teacher_response_mask (torch.Tensor):
+            Mask for teacher responses, shape (batch_size, response_length).
+    
+    Returns:
+        d_loss (torch.Tensor):
+            Scalar discriminator loss.
+    """
+    # Sum values over sequence length to get sequence-level scores
+    teacher_reward = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)
+    student_reward = torch.sum(student_vpreds * response_mask, dim=-1)
+    
+    # Discriminator loss: maximize log(sigmoid(teacher_reward - student_reward))
+    # Equivalent to minimizing -log(sigmoid(teacher_reward - student_reward))
+    d_loss = -torch.nn.functional.logsigmoid(teacher_reward - student_reward).mean()
+    
+    return d_loss
+
+
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.
