@@ -359,19 +359,31 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
-
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
-
-        select_keys = [
-            "responses",
-            "response_mask",
-            "input_ids",
-            "attention_mask",
-            "position_ids",
-            "old_log_probs",
-            "advantages",
-        ]
-        if self.config.use_kl_loss:
+        temperature = data.meta_info.get("temperature", 1.0)
+        
+        # Check if using SFT mode (SeqKD stage)
+        use_sft_mode = data.meta_info.get("use_sft_mode", False)
+        
+        if use_sft_mode:
+            # SeqKD stage: use teacher data only
+            select_keys = [
+                "teacher_response",
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+            ]
+        else:
+            # Warmup/GAD stage: use student responses
+            select_keys = [
+                "responses",
+                "response_mask",
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "old_log_probs",
+                "advantages",
+            ]
+        if not use_sft_mode and self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -407,9 +419,17 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
+                    
+                    if use_sft_mode:
+                        # SeqKD stage: use teacher data
+                        response_length = model_inputs["teacher_response"].size(-1)
+                        teacher_attention_mask = model_inputs["teacher_attention_mask"]
+                        response_mask = teacher_attention_mask[:, -response_length:]
+                    else:
+                        # Warmup/GAD stage: use student data
+                        response_mask = model_inputs["response_mask"]
+                        old_log_prob = model_inputs["old_log_probs"]
+                        advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -423,45 +443,82 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
-
-                    # for fully_async_policy recipe
-                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                        old_log_prob = model_inputs["old_log_probs"]
+                    
+                    if use_sft_mode:
+                        # SeqKD stage: forward pass with teacher data
+                        # Temporarily replace input_ids with teacher_input_ids
+                        original_input_ids = model_inputs.get("input_ids")
+                        original_attention_mask = model_inputs.get("attention_mask")
+                        original_position_ids = model_inputs.get("position_ids")
+                        
+                        model_inputs["input_ids"] = model_inputs["teacher_input_ids"]
+                        model_inputs["attention_mask"] = model_inputs["teacher_attention_mask"]
+                        model_inputs["position_ids"] = model_inputs["teacher_position_ids"]
+                        
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=False
+                        )
+                        
+                        # Restore original keys (if they existed)
+                        if original_input_ids is not None:
+                            model_inputs["input_ids"] = original_input_ids
+                            model_inputs["attention_mask"] = original_attention_mask
+                            model_inputs["position_ids"] = original_position_ids
                     else:
-                        if on_policy:
-                            old_log_prob = log_prob.detach()
-                        else:
-                            old_log_prob = model_inputs["old_log_probs"]
+                        # Warmup/GAD stage: forward pass with student data
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # for fully_async_policy recipe
+                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
+                            old_log_prob = model_inputs["old_log_probs"]
+                        else:
+                            if on_policy:
+                                old_log_prob = log_prob.detach()
+                            else:
+                                old_log_prob = model_inputs["old_log_probs"]
+
+                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla") if not use_sft_mode else "sft"
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
                     # Extract pre-computed rollout importance sampling weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-                    # are computed centrally in ray_trainer.py for consistency and efficiency.
-                    # This ensures metrics are computed uniformly across all batches at the trainer level
-                    # and avoids redundant computation across workers and micro-batches.
+                    if use_sft_mode:
+                        # SeqKD stage: use SFT loss
+                        from verl.trainer.ppo.core_algos import compute_sft_loss
+                        
+                        pg_loss = compute_sft_loss(
+                            log_prob=log_prob,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        pg_clipfrac = torch.tensor(0.0)
+                        ppo_kl = torch.tensor(0.0)
+                        pg_clipfrac_lower = torch.tensor(0.0)
+                        
+                        micro_batch_metrics.update({
+                            "actor/sft_loss": pg_loss.detach().item(),
+                            "actor/teacher_pg_loss": pg_loss.detach().item(),  # For compatibility
+                        })
+                    else:
+                        # Warmup/GAD stage: use PPO/GSPO loss
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-                    # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                        # Compute policy loss (all functions return 4 values)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

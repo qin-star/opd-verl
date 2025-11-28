@@ -1428,6 +1428,36 @@ def compute_discriminator_loss(
     return d_loss
 
 
+def compute_sft_loss(
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+) -> torch.Tensor:
+    """
+    Compute supervised fine-tuning loss for SeqKD stage.
+    
+    This loss maximizes the log probability of teacher responses,
+    which is equivalent to minimizing the negative log likelihood.
+    
+    Args:
+        log_prob (torch.Tensor):
+            Log probabilities of tokens, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask for valid response tokens, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Loss aggregation mode. Defaults to "token-mean".
+    
+    Returns:
+        sft_loss (torch.Tensor):
+            Scalar SFT loss (negative log likelihood).
+    """
+    # SFT loss: maximize log probability of teacher response
+    # Equivalent to minimizing negative log likelihood
+    sft_loss = -agg_loss(loss_mat=log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    return sft_loss
+
+
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.
