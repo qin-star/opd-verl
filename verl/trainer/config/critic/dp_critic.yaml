@@ -63,10 +63,9 @@ model:
     reshard_after_forward: true
     fsdp_size: -1
     forward_prefetch: false
-    model_dtype: fp32
+    model_dtype: bfloat16
     use_orig_params: false
     strategy: fsdp
-    dtype: bfloat16
 
 # Forward-only batch size during inference (global)
 forward_micro_batch_size: ${oc.select:.ppo_micro_batch_size,null}
