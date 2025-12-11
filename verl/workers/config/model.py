@@ -23,6 +23,7 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
+from verl.workers.config.engine import FSDPEngineConfig
 
 __all__ = ["HFModelConfig"]
 
@@ -89,6 +90,9 @@ class HFModelConfig(BaseConfig):
     fused_kernel_options: dict = field(default_factory=dict)
 
     architectures: Optional[list[str]] = None
+    
+    # FSDP configuration for critic model
+    fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)

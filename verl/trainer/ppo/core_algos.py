@@ -1396,12 +1396,19 @@ def compute_discriminator_loss(
     teacher_vpreds: torch.Tensor,
     response_mask: torch.Tensor,
     teacher_response_mask: torch.Tensor,
-) -> torch.Tensor:
+    margin: float = 0.5,
+) -> tuple:
     """
     Compute discriminator loss for GAD training.
     
     The discriminator is trained to give higher scores to teacher responses
-    than student responses using a binary cross-entropy style loss.
+    than student responses. This implementation uses:
+    1. Scaled logsigmoid loss (prevents gradient vanishing by normalizing the difference)
+    2. Margin-based hinge loss (ensures minimum separation between teacher and student)
+    
+    Key insight: The original logsigmoid loss saturates when |diff| is large.
+    By normalizing to mean (instead of sum) and adding a hinge loss, we ensure
+    consistent gradients throughout training.
     
     Args:
         student_vpreds (torch.Tensor):
@@ -1412,20 +1419,60 @@ def compute_discriminator_loss(
             Mask for student responses, shape (batch_size, response_length).
         teacher_response_mask (torch.Tensor):
             Mask for teacher responses, shape (batch_size, response_length).
+        margin (float):
+            Target margin between teacher and student scores. Default 1.0.
     
     Returns:
-        d_loss (torch.Tensor):
-            Scalar discriminator loss.
+        d_loss (torch.Tensor): Total discriminator loss.
+        loss_info (dict): Dictionary containing individual loss components.
     """
-    # Sum values over sequence length to get sequence-level scores
-    teacher_reward = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)
-    student_reward = torch.sum(student_vpreds * response_mask, dim=-1)
+    # Compute sequence-level scores
+    # Raw scores (sum) for upper bound constraint - prevents score drift
+    teacher_score_raw = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)
+    student_score_raw = torch.sum(student_vpreds * response_mask, dim=-1)
+    raw_diff = teacher_score_raw - student_score_raw
     
-    # Discriminator loss: maximize log(sigmoid(teacher_reward - student_reward))
-    # Equivalent to minimizing -log(sigmoid(teacher_reward - student_reward))
-    d_loss = -torch.nn.functional.logsigmoid(teacher_reward - student_reward).mean()
+    # Normalized scores (mean) for ranking loss - scale invariant
+    teacher_mask_sum = teacher_response_mask.sum(dim=-1).clamp(min=1)
+    student_mask_sum = response_mask.sum(dim=-1).clamp(min=1)
+    teacher_score = teacher_score_raw / teacher_mask_sum
+    student_score = student_score_raw / student_mask_sum
+    diff = teacher_score - student_score
     
-    return d_loss
+    # 1. Lower bound hinge loss: penalize when diff < margin (teacher not high enough)
+    hinge_loss_lower = torch.nn.functional.relu(margin - diff).mean()
+    
+    # 2. Upper bound hinge loss: penalize when RAW diff > max_raw_diff (prevent runaway)
+    # This prevents the discriminator from pushing student score to -infinity
+    # Use RAW diff (not normalized) to directly constrain score magnitude
+    max_raw_diff = 20.0  # Limit raw score difference to prevent drift to extreme values
+    hinge_loss_upper = torch.nn.functional.relu(raw_diff - max_raw_diff).mean()
+    
+    # 3. Logsigmoid ranking loss with temperature scaling
+    # Scale down the difference to prevent saturation
+    temperature = 2.0  # Prevents saturation by scaling down large differences
+    scaled_diff = diff / temperature
+    scaled_diff = torch.clamp(scaled_diff, min=-10, max=10)
+    ranking_loss = -torch.nn.functional.logsigmoid(scaled_diff).mean()
+    
+    # 4. Score regularization: prevent RAW scores from drifting too far from zero
+    # This keeps the discriminator from collapsing to extreme values
+    # Use raw scores (not normalized) to directly penalize large absolute values
+    # Coefficient 0.001 because raw scores can be ~100x larger than normalized scores
+    score_reg = 0.001 * (teacher_score_raw.pow(2).mean() + student_score_raw.pow(2).mean())
+    
+    # Combined loss with upper bound constraint and regularization
+    d_loss = hinge_loss_lower + hinge_loss_upper + 0.5 * ranking_loss + score_reg
+    
+    loss_info = {
+        "hinge_loss_lower": hinge_loss_lower.detach().item(),
+        "hinge_loss_upper": hinge_loss_upper.detach().item(),
+        "ranking_loss": ranking_loss.detach().item(),
+        "score_diff": diff.mean().detach().item(),
+        "score_reg": score_reg.detach().item(),
+    }
+    
+    return d_loss, loss_info
 
 
 def compute_sft_loss(

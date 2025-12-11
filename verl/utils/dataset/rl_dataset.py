@@ -106,6 +106,7 @@ class RLHFDataset(Dataset):
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.max_response_length = config.get("max_response_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
@@ -125,6 +126,11 @@ class RLHFDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+        
+        # CRITICAL FIX: Ensure these attributes are always set for pickle compatibility
+        # This is a defensive measure to prevent AttributeError in DataLoader workers
+        assert hasattr(self, 'max_response_length'), "max_response_length not initialized!"
+        assert hasattr(self, 'max_prompt_length'), "max_prompt_length not initialized!"
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -205,9 +211,12 @@ class RLHFDataset(Dataset):
                         traceback.print_exc()
                         return self.max_prompt_length + 1
 
+            # 强制使用单进程过滤，避免子进程崩溃问题
+            # num_proc=None 完全禁用多进程，num_proc=1 仍可能创建子进程
+            filter_num_proc = None if self.num_workers is None or self.num_workers <= 1 else self.num_workers
             dataframe = dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
-                num_proc=self.num_workers,
+                num_proc=filter_num_proc,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
 
@@ -394,8 +403,23 @@ class RLHFDataset(Dataset):
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
         interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
         need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
+        
+        # WORKAROUND: Framework always creates reward_manager even when reward_model.enable=False
+        # Add dummy data_source and reward_model to prevent KeyError
+        if "data_source" not in row_dict:
+            row_dict["data_source"] = "dummy"  # Will not be used when reward_model.enable=False
+        
+        if "reward_model" not in row_dict:
+            # Use teacher_response as ground_truth if available (already extracted at line 305)
+            # Otherwise use empty string as placeholder
+            ground_truth = teacher_response if teacher_response is not None else ""
+            row_dict["reward_model"] = {
+                "ground_truth": ground_truth,
+                "style": "rule"
+            }
+        
         if need_tools_kwargs and not tools_kwargs:
-            logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
+            logger.warning("tools_kwargs is empty for index {}", index)
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
@@ -405,10 +429,12 @@ class RLHFDataset(Dataset):
             # Tokenize teacher response
             teacher_response_tokens = self.tokenizer(teacher_response, return_tensors="pt", add_special_tokens=False)
             teacher_response_ids = teacher_response_tokens["input_ids"]
+            teacher_response_attention_mask = teacher_response_tokens["attention_mask"]
             
             # Postprocess teacher response
-            teacher_response_ids, _ = verl_F.postprocess_data(
+            teacher_response_ids, teacher_response_attention_mask = verl_F.postprocess_data(
                 input_ids=teacher_response_ids,
+                attention_mask=teacher_response_attention_mask,
                 max_length=self.max_response_length,
                 pad_token_id=self.tokenizer.pad_token_id,
                 left_pad=False,  # Right pad for responses
@@ -445,3 +471,23 @@ class RLHFDataset(Dataset):
             return state
 
         return self.__dict__.copy()
+
+    def __setstate__(self, state):
+        """Restore object state after unpickling.
+        
+        This method is required for proper deserialization when the dataset
+        is passed to DataLoader worker processes via pickle.
+        """
+        # First restore all attributes
+        self.__dict__.update(state)
+        
+        # If dataframe was removed during pickling, reload it
+        if not self.serialize_dataset and "dataframe" not in state:
+            self._read_files_and_tokenize()
+        
+        # Ensure critical attributes exist (defensive programming)
+        # This handles edge cases where attributes might be missing
+        if not hasattr(self, 'max_response_length'):
+            self.max_response_length = self.config.get("max_response_length", 1024)
+        if not hasattr(self, 'max_prompt_length'):
+            self.max_prompt_length = self.config.get("max_prompt_length", 1024)

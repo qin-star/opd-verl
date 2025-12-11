@@ -1154,11 +1154,16 @@ class RayPPOTrainer:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
+                        # Initialize reward_tensor and reward_extra_infos_dict
+                        reward_tensor = None
+                        reward_extra_infos_dict = {}
+                        
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
-                        else:
+                        elif not (self.use_critic and not self.use_rm):
+                            # Only compute reward_fn if not in GAD mode (critic as reward)
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
@@ -1192,13 +1197,27 @@ class RayPPOTrainer:
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
+                            print(f"[DEBUG ray_trainer] values from critic: {values.batch['values'].shape}")
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
+                        # Determine final reward_tensor based on configuration
                         if self.config.reward_model.launch_reward_fn_async:
+                            # Async reward computation
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        elif self.use_critic and not self.use_rm and "values" in batch.batch:
+                            # GAD mode: Use critic values as reward (aligned with official GAD)
+                            reward_tensor = batch.batch["values"]
+                            print(f"[DEBUG ray_trainer] reward_tensor (from values): {reward_tensor.shape}")
+                        elif reward_tensor is None:
+                            # Fallback: should not happen if configuration is correct
+                            raise RuntimeError(
+                                "reward_tensor is None. Configuration issue detected:\n"
+                                f"  use_critic={self.use_critic}, use_rm={self.use_rm}\n"
+                                f"  Please check: 1) Enable critic, or 2) Enable reward_model, or 3) Provide reward_fn"
+                            )
+                        
+                        # Set token_level_scores
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:

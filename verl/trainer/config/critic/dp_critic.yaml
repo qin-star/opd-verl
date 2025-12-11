@@ -11,7 +11,7 @@ defaults:
   - ../optim@optim: fsdp
 
   # fsdp engine config
-  - ../engine@model.fsdp_config: fsdp
+  - ../engine@engine: fsdp
 
   # dp actor config, inheriting from trainer/config/critic/critic.yaml
   - critic
@@ -29,7 +29,7 @@ strategy: fsdp
 model:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: verl.workers.config.FSDPCriticModelCfg
+  _target_: verl.workers.config.HFModelConfig
 
   # Whether to use shared memory for loading the model
   use_shm: False
@@ -51,6 +51,22 @@ model:
 
   # LoRA target modules: "all-linear" or list of linear projection layers
   target_modules: all-linear
+
+  # FSDP configuration for critic model
+  fsdp_config:
+    _target_: verl.workers.config.FSDPEngineConfig
+    wrap_policy:
+      min_num_params: 0
+    param_offload: false
+    optimizer_offload: false
+    offload_policy: false
+    reshard_after_forward: true
+    fsdp_size: -1
+    forward_prefetch: false
+    model_dtype: fp32
+    use_orig_params: false
+    strategy: fsdp
+    dtype: bfloat16
 
 # Forward-only batch size during inference (global)
 forward_micro_batch_size: ${oc.select:.ppo_micro_batch_size,null}

@@ -103,6 +103,10 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source == "dummy":
+        # Dummy reward for warmup stage when reward_model.enable=False
+        # This should not be called in practice, but prevents crashes
+        return 0.0
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

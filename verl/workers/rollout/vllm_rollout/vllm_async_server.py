@@ -152,7 +152,9 @@ class vLLMHttpServerBase:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        # 只有当用户未指定 max_model_len 时才使用默认值
+        if not self.config.max_model_len:
+            self.config.max_model_len = self.config.prompt_length + self.config.response_length
         self.rollout_mode = rollout_mode
         self.workers = workers
 

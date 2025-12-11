@@ -400,6 +400,7 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        print(f"[DEBUG dp_actor] len(mini_batches)={len(mini_batches)}, ppo_epochs={self.config.ppo_epochs}, on_policy={on_policy}")
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
@@ -478,6 +479,10 @@ class DataParallelPPOActor(BasePPOActor):
                                 old_log_prob = log_prob.detach()
                             else:
                                 old_log_prob = model_inputs["old_log_probs"]
+                        
+                        # Debug: check if old_log_prob and log_prob are different
+                        diff = (old_log_prob - log_prob).abs().mean()
+                        print(f"[DEBUG dp_actor] old_log_prob vs log_prob diff: {diff.item():.6f}, on_policy={on_policy}")
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla") if not use_sft_mode else "sft"
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

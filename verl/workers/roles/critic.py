@@ -150,6 +150,14 @@ class CriticWorker(Worker, DistProfilerExtension):
             values = output["values"]
             values = no_padding_2_padding(values, data)  # (bsz, response_length)
 
+            # Fix: Ensure values is 2D (batch, seq_len) for GAD mode
+            # If values has 3 dimensions (batch, seq_len, num_classes), reduce to 2D
+            if values.dim() == 3:
+                print(f"[DEBUG roles/critic] values shape before fix: {values.shape}")
+                # Use the first class logit as the value
+                values = values[:, :, 0]
+                print(f"[DEBUG roles/critic] values shape after fix: {values.shape}")
+
             output = DataProto.from_dict(
                 tensors={"values": values.float()},
             )

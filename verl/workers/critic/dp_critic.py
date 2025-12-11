@@ -114,8 +114,13 @@ class DataParallelPPOCritic(BasePPOCritic):
                     # For trl.AutoModelForCausalLMWithValueHead
                     values_rmpad = output[2].squeeze(0).unsqueeze(-1)
                 else:
+                    # For AutoModelForTokenClassification with num_labels=1
+                    # output.logits shape: (1, total_nnz, 1) or (1, total_nnz)
                     values_rmpad = output.logits
-                    values_rmpad = values_rmpad.squeeze(0)  # (total_nnz)
+                    values_rmpad = values_rmpad.squeeze(0)  # (total_nnz) or (total_nnz, 1)
+                    if values_rmpad.dim() == 2:
+                        values_rmpad = values_rmpad.squeeze(-1)  # (total_nnz)
+                    values_rmpad = values_rmpad.unsqueeze(-1)  # (total_nnz, 1) for pad_input
 
                 # gather output if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
@@ -148,9 +153,11 @@ class DataParallelPPOCritic(BasePPOCritic):
                     # For trl.AutoModelForCausalLMWithValueHead
                     values = output[2]
                 else:
+                    # For AutoModelForTokenClassification with num_labels=1
+                    # output.logits shape: (batch, seq_len, 1) or (batch, seq_len)
                     values = output.logits
-                # For sequence-level reward model: extract current token values
-                values = values[:, -response_length:].squeeze(-1)
+                # Squeeze the last dimension if num_labels=1
+                values = values[:, -response_length:].squeeze(-1)  # (batch, response_length)
                 
                 # Apply last token mask for sequence-level scoring
                 response_mask = attention_mask[:, -response_length:]
@@ -244,7 +251,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             micro_batches = data.split(micro_batch_size)
 
         values_lst = []
-        for micro_batch in micro_batches:
+        for i, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
@@ -333,11 +340,17 @@ class DataParallelPPOCritic(BasePPOCritic):
                         student_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
                         teacher_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=True)
                         
-                        # Compute discriminator accuracy
-                        d_acc = (teacher_vpreds.sum(dim=-1) > student_vpreds.sum(dim=-1)).float().mean()
+                        # Compute sequence-level scores for accuracy calculation
+                        # Note: vpreds already have last_token_mask applied, so sum gives the last token value
+                        teacher_score = teacher_vpreds.sum(dim=-1)  # Last token value (others are 0)
+                        student_score = student_vpreds.sum(dim=-1)  # Last token value (others are 0)
                         
-                        # Compute discriminator loss
-                        d_loss = core_algos.compute_discriminator_loss(
+                        # Compute discriminator accuracy (per-sample comparison)
+                        # For GAD: teacher should score higher than student
+                        d_acc = (teacher_score > student_score).float().mean()
+                        
+                        # Compute discriminator loss (now returns tuple with loss_info)
+                        d_loss, loss_info = core_algos.compute_discriminator_loss(
                             student_vpreds=student_vpreds,
                             teacher_vpreds=teacher_vpreds,
                             response_mask=response_mask,
@@ -357,8 +370,14 @@ class DataParallelPPOCritic(BasePPOCritic):
                             {
                                 "critic/d_loss": d_loss.detach().item(),
                                 "critic/d_acc": d_acc.detach().item(),
-                                "critic/student_value_mean": (student_vpreds * response_mask).sum(dim=-1).mean().detach().item(),
-                                "critic/teacher_value_mean": (teacher_vpreds * teacher_response_mask).sum(dim=-1).mean().detach().item(),
+                                "critic/student_value_mean": student_score.mean().detach().item(),
+                                "critic/teacher_value_mean": teacher_score.mean().detach().item(),
+                                "critic/raw_score_diff": (teacher_score - student_score).mean().detach().item(),
+                                "critic/hinge_loss_lower": loss_info["hinge_loss_lower"],
+                                "critic/hinge_loss_upper": loss_info["hinge_loss_upper"],
+                                "critic/ranking_loss": loss_info["ranking_loss"],
+                                "critic/score_diff": loss_info["score_diff"],
+                                "critic/score_reg": loss_info.get("score_reg", 0.0),
                             }
                         )
                     else:
