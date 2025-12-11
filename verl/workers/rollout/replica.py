@@ -16,7 +16,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel
 from ray.actor import ActorHandle
@@ -34,6 +34,8 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
+    routed_experts: Optional[Any] = None
+    """routed experts of response token ids"""
 
 
 class RolloutMode(Enum):
