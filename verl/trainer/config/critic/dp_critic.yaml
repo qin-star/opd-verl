@@ -11,7 +11,7 @@ defaults:
   - ../optim@optim: fsdp
 
   # fsdp engine config
-  - ../engine@engine: fsdp
+  - ../engine@model.fsdp_config: fsdp
 
   # dp actor config, inheriting from trainer/config/critic/critic.yaml
   - critic
@@ -29,7 +29,7 @@ strategy: fsdp
 model:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: verl.workers.config.HFModelConfig
+  _target_: verl.workers.config.FSDPCriticModelCfg
 
   # Whether to use shared memory for loading the model
   use_shm: False
@@ -52,20 +52,14 @@ model:
   # LoRA target modules: "all-linear" or list of linear projection layers
   target_modules: all-linear
 
-  # FSDP configuration for critic model
-  fsdp_config:
-    _target_: verl.workers.config.FSDPEngineConfig
-    wrap_policy:
-      min_num_params: 0
-    param_offload: false
-    optimizer_offload: false
-    offload_policy: false
-    reshard_after_forward: true
-    fsdp_size: -1
-    forward_prefetch: false
-    model_dtype: bfloat16
-    use_orig_params: false
-    strategy: fsdp
+  # TiledMLP configuration for memory-efficient MLP computation.
+  tiled_mlp:
+
+    # whether to enable TiledMLP
+    enabled: False
+
+    # number of shards to split the input
+    num_shards: 4
 
 # Forward-only batch size during inference (global)
 forward_micro_batch_size: ${oc.select:.ppo_micro_batch_size,null}
@@ -74,6 +68,7 @@ forward_micro_batch_size: ${oc.select:.ppo_micro_batch_size,null}
 forward_micro_batch_size_per_gpu: ${oc.select:.ppo_micro_batch_size_per_gpu,null}
 
 # Sequence parallelism size for Ulysses-style model parallelism
+# [DEPRECATED] use fsdp_config.ulysses_sequence_parallel_size instead
 ulysses_sequence_parallel_size: 1
 
 # Gradient clipping for critic updates
