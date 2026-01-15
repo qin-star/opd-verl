@@ -446,15 +446,17 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     
                     if use_sft_mode:
-                        # SeqKD stage: forward pass with teacher data
+                        # SeqKD/Warmup SFT stage: forward pass with teacher data
                         # Temporarily replace input_ids with teacher_input_ids
                         original_input_ids = model_inputs.get("input_ids")
                         original_attention_mask = model_inputs.get("attention_mask")
                         original_position_ids = model_inputs.get("position_ids")
+                        original_responses = model_inputs.get("responses")
                         
                         model_inputs["input_ids"] = model_inputs["teacher_input_ids"]
                         model_inputs["attention_mask"] = model_inputs["teacher_attention_mask"]
                         model_inputs["position_ids"] = model_inputs["teacher_position_ids"]
+                        model_inputs["responses"] = model_inputs["teacher_response"]  # For _forward_micro_batch
                         
                         entropy, log_prob = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=False
@@ -465,6 +467,8 @@ class DataParallelPPOActor(BasePPOActor):
                             model_inputs["input_ids"] = original_input_ids
                             model_inputs["attention_mask"] = original_attention_mask
                             model_inputs["position_ids"] = original_position_ids
+                        if original_responses is not None:
+                            model_inputs["responses"] = original_responses
                     else:
                         # Warmup/GAD stage: forward pass with student data
                         entropy, log_prob = self._forward_micro_batch(
@@ -533,7 +537,9 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
-                    if self.config.use_kl_loss:
+                    # KL loss is only applied in non-SFT mode (PPO/GSPO training)
+                    # In SFT mode, we only use cross-entropy loss on teacher response
+                    if self.config.use_kl_loss and not use_sft_mode:
                         ref_log_prob = model_inputs["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(

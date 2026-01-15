@@ -202,6 +202,10 @@ trainer:
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
 
+  # Whether to use SFT loss on teacher response during warmup phase (for GAD training)
+  # When True, Generator uses cross-entropy loss on teacher response instead of PPO/GSPO loss
+  warmup_use_sft: False
+
   # Default path to distributed filesystem for saving checkpoints
   default_hdfs_dir: null
 

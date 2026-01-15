@@ -107,6 +107,11 @@ def default_compute_score(
         # Dummy reward for warmup stage when reward_model.enable=False
         # This should not be called in practice, but prevents crashes
         return 0.0
+    elif data_source in ["gad_format", "gad", "format_check"]:
+        # GAD 训练专用格式奖励
+        # 用于惩罚时间戳泄漏、重复输出、JSON 不完整等问题
+        from . import gad_format_reward
+        res = gad_format_reward.compute_score(data_source, solution_str, ground_truth, extra_info)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

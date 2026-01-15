@@ -114,6 +114,11 @@ class ResourcePoolManager:
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
         if total_available_gpus < total_required_gpus:
+            # Skip GPU check if SKIP_GPU_CHECK env var is set
+            import os
+            if os.environ.get("SKIP_GPU_CHECK", "0") == "1":
+                print(f"WARNING: Skipping GPU check. Available: {total_available_gpus}, Required: {total_required_gpus}")
+                return
             raise ValueError(
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )
@@ -1148,6 +1153,59 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # === 打印 student response 样本 ===
+                    print_interval = getattr(self.config.trainer, "print_sample_interval", 10)  # 打印间隔（默认10步）
+                    num_samples = getattr(self.config.trainer, "print_sample_num", 2)  # 打印样本数（默认2，设为0可禁用）
+                    if self.global_steps % print_interval == 0 and num_samples > 0:
+                        try:
+                            # 获取 response（右填充，直接解码即可）
+                            sample_responses = batch.batch["responses"][:num_samples]
+                            responses = self.tokenizer.batch_decode(sample_responses, skip_special_tokens=True)
+                            
+                            # 获取 prompt - 优先使用 full_prompts（原始文本），否则从 token IDs 解码
+                            prompts = []
+                            if "full_prompts" in batch.non_tensor_batch:
+                                # 使用原始 prompt 文本（最准确）
+                                for i in range(min(num_samples, len(batch.non_tensor_batch["full_prompts"]))):
+                                    prompts.append(batch.non_tensor_batch["full_prompts"][i])
+                            else:
+                                # 从 token IDs 解码，需要去除左填充的 pad tokens
+                                sample_prompts = batch.batch["prompts"][:num_samples]
+                                attention_mask = batch.batch["attention_mask"][:num_samples]
+                                prompt_length = sample_prompts.shape[1]
+                                
+                                for i in range(num_samples):
+                                    # 获取 prompt 部分的 attention mask
+                                    prompt_mask = attention_mask[i, :prompt_length]
+                                    # 找到第一个非 pad token 的位置
+                                    valid_start = (prompt_mask == 1).nonzero(as_tuple=True)[0]
+                                    if len(valid_start) > 0:
+                                        start_idx = valid_start[0].item()
+                                        valid_prompt_ids = sample_prompts[i, start_idx:]
+                                    else:
+                                        valid_prompt_ids = sample_prompts[i]
+                                    prompts.append(self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True))
+
+                            # 使用列表构建输出，减少 print 调用次数
+                            output_lines = [
+                                "",
+                                "=" * 80,
+                                f"[Step {self.global_steps}] Student Response Samples:",
+                                "=" * 80,
+                            ]
+                            for i, (p, r) in enumerate(zip(prompts, responses)):
+                                output_lines.extend([
+                                    f"\n--- Sample {i + 1} ---",
+                                    f"[Prompt]\n{p}",
+                                    f"[Response]\n{r}",
+                                ])
+                            output_lines.append("=" * 80 + "\n")
+                            print("\n".join(output_lines))
+                        except Exception as e:
+                            import traceback
+                            print(f"[Warning] Failed to print samples: {e}")
+                            traceback.print_exc()
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1157,7 +1215,7 @@ class RayPPOTrainer:
                         # Initialize reward_tensor and reward_extra_infos_dict
                         reward_tensor = None
                         reward_extra_infos_dict = {}
-                        
+
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
@@ -1166,17 +1224,196 @@ class RayPPOTrainer:
                             # Only compute reward_fn if not in GAD mode (critic as reward)
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                        # GAD mode: compute format reward if enabled
+                        # This allows combining discriminator reward with format penalty
+                        use_format_reward = getattr(self.config.trainer, "use_format_reward", False)
+                        format_reward_tensor = None
+                        format_metrics = {}  # 用于存储格式奖励的详细指标
+                        
+                        if use_format_reward and self.use_critic and not self.use_rm:
+                            try:
+                                from verl.utils.reward_score.gad_format_reward import compute_format_score
+
+                                # Decode responses to text for format checking
+                                response_ids = batch.batch["responses"]
+                                response_texts = self.tokenizer.batch_decode(
+                                    response_ids, skip_special_tokens=True
+                                )
+
+                                # Get ground truth (teacher_response) if available
+                                batch_size = len(response_texts)
+                                ground_truths = []
+
+                                reward_model_data = batch.non_tensor_batch.get("reward_model", None)
+                                if reward_model_data is not None:
+                                    if hasattr(reward_model_data, "__len__"):
+                                        for i in range(min(len(reward_model_data), batch_size)):
+                                            item = reward_model_data[i]
+                                            if isinstance(item, dict):
+                                                ground_truths.append(item.get("ground_truth", ""))
+                                            else:
+                                                ground_truths.append("")
+                                    else:
+                                        ground_truths = [""] * batch_size
+                                else:
+                                    ground_truths = [""] * batch_size
+
+                                while len(ground_truths) < batch_size:
+                                    ground_truths.append("")
+
+                                # Compute format scores for each response
+                                format_scores = []
+                                format_penalties_list = []
+                                
+                                # 统计各类惩罚的计数
+                                penalty_counts = {
+                                    "timestamp_leak": 0,
+                                    "repetition": 0,
+                                    "json_incomplete": 0,
+                                    "json_invalid": 0,
+                                    "too_long": 0,
+                                    "too_short": 0,
+                                    "empty_output": 0,
+                                    "thinking_leak": 0,
+                                    "mixed_language": 0,
+                                    "json_value_pollution": 0,
+                                    "double_output": 0,
+                                    "json_repetition": 0,
+                                }
+                                penalty_values = {
+                                    "timestamp_leak": [],
+                                    "repetition": [],
+                                    "json_incomplete": [],
+                                    "json_invalid": [],
+                                    "too_long": [],
+                                    "too_short": [],
+                                    "thinking_leak": [],
+                                    "mixed_language": [],
+                                    "json_value_pollution": [],
+                                    "double_output": [],
+                                    "json_repetition": [],
+                                }
+                                
+                                for i, resp_text in enumerate(response_texts):
+                                    gt = ground_truths[i] if i < len(ground_truths) else ""
+                                    result = compute_format_score(resp_text, gt)
+                                    format_scores.append(result["score"])
+                                    penalties = result["penalties"]
+                                    format_penalties_list.append(penalties)
+                                    
+                                    # 统计各类惩罚
+                                    # penalties 结构: {"format": {"type": "xxx", "penalty": 0.3}, "content": {...}, ...}
+                                    # 需要从嵌套结构中提取具体的 type
+                                    for category, penalty_info in penalties.items():
+                                        if isinstance(penalty_info, dict):
+                                            # 获取具体的惩罚类型
+                                            penalty_type = penalty_info.get("type", category)
+                                            # 映射到统计 key（处理不同命名）
+                                            type_mapping = {
+                                                "repetition_consecutive": "repetition",
+                                                "repetition_ngram": "repetition",
+                                                "json_missing": "json_invalid",
+                                                "json_prefix": "json_invalid",
+                                                "json_keys_missing": "json_invalid",
+                                            }
+                                            mapped_type = type_mapping.get(penalty_type, penalty_type)
+                                            
+                                            if mapped_type in penalty_counts:
+                                                penalty_counts[mapped_type] += 1
+                                                if mapped_type in penalty_values and "penalty" in penalty_info:
+                                                    penalty_values[mapped_type].append(penalty_info["penalty"])
+                                        elif category == "empty_output":
+                                            # empty_output 是布尔值
+                                            penalty_counts["empty_output"] += 1
+
+                                # Convert to tensor
+                                response_mask = batch.batch["response_mask"]
+                                format_reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
+
+                                for i, score in enumerate(format_scores):
+                                    mask_sum = response_mask[i].sum().int().item()
+                                    if mask_sum > 0:
+                                        format_reward_tensor[i, mask_sum - 1] = score
+
+                                # ========== 计算详细的格式奖励指标 ==========
+                                avg_format_score = sum(format_scores) / len(format_scores) if format_scores else 0
+                                num_with_penalties = sum(1 for p in format_penalties_list if p)
+                                
+                                # 基础指标
+                                format_metrics["format/reward_avg"] = avg_format_score
+                                format_metrics["format/reward_min"] = min(format_scores) if format_scores else 0
+                                format_metrics["format/reward_max"] = max(format_scores) if format_scores else 0
+                                format_metrics["format/penalty_ratio"] = num_with_penalties / len(format_scores) if format_scores else 0
+                                
+                                # 各类惩罚的比例
+                                for penalty_type, count in penalty_counts.items():
+                                    format_metrics[f"format/{penalty_type}_ratio"] = count / batch_size if batch_size > 0 else 0
+                                
+                                # 各类惩罚的平均值（仅对触发的样本）
+                                for penalty_type, values in penalty_values.items():
+                                    if values:
+                                        format_metrics[f"format/{penalty_type}_avg_penalty"] = sum(values) / len(values)
+                                
+                                # 将格式指标添加到 metrics（不是 reward_extra_infos_dict，避免分割问题）
+                                metrics.update(format_metrics)
+
+                                # ========== 打印详细的格式奖励日志 ==========
+                                print_format_details = getattr(self.config.trainer, "print_format_reward_details", True)
+                                if print_format_details and self.global_steps % 10 == 0:
+                                    print("\n" + "=" * 80)
+                                    print(f"[Step {self.global_steps}] Format Reward Statistics:")
+                                    print("=" * 80)
+                                    print(f"  Average Score: {avg_format_score:.4f} (range: [{min(format_scores):.4f}, {max(format_scores):.4f}])")
+                                    print(f"  Samples with Penalties: {num_with_penalties}/{batch_size} ({num_with_penalties/batch_size*100:.1f}%)")
+                                    print("\n  Penalty Breakdown:")
+                                    for penalty_type, count in penalty_counts.items():
+                                        if count > 0:
+                                            ratio = count / batch_size * 100
+                                            avg_val = sum(penalty_values.get(penalty_type, [0])) / max(len(penalty_values.get(penalty_type, [1])), 1)
+                                            print(f"    - {penalty_type}: {count}/{batch_size} ({ratio:.1f}%), avg_penalty={avg_val:.3f}")
+                                    
+                                    # 打印有问题的样本示例
+                                    print_problem_samples = getattr(self.config.trainer, "print_format_problem_samples", 2)
+                                    if print_problem_samples > 0:
+                                        problem_indices = [i for i, p in enumerate(format_penalties_list) if p][:print_problem_samples]
+                                        if problem_indices:
+                                            print("\n  Problem Sample Examples:")
+                                            for idx in problem_indices:
+                                                print(f"\n    --- Sample {idx} (score={format_scores[idx]:.3f}) ---")
+                                                print(f"    Penalties: {format_penalties_list[idx]}")
+                                                resp = response_texts[idx]
+                                                print(f"    Response: {resp[:300]}{'...' if len(resp) > 300 else ''}")
+                                    print("=" * 80 + "\n")
+
+                            except Exception as e:
+                                print(f"[WARNING] Format reward computation failed: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                format_reward_tensor = None
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        
+                        # 计算熵
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        
+                        # 计算困惑度 (Perplexity)
+                        # PPL = exp(-mean(log_probs))
+                        old_log_probs = old_log_prob.batch["old_log_probs"]
+                        avg_log_prob = masked_mean(old_log_probs, mask=response_masks, axis=-1)  # 每个样本的平均 log_prob
+                        perplexity = torch.exp(-avg_log_prob).mean().item()  # batch 平均困惑度
+                        
+                        old_log_prob_metrics = {
+                            "actor/entropy": entropy_agg.detach().item(),
+                            "actor/perplexity": perplexity
+                        }
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        batch = batch.uni
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1207,8 +1444,65 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         elif self.use_critic and not self.use_rm and "values" in batch.batch:
                             # GAD mode: Use critic values as reward (aligned with official GAD)
-                            reward_tensor = batch.batch["values"]
-                            print(f"[DEBUG ray_trainer] reward_tensor (from values): {reward_tensor.shape}")
+                            discriminator_reward = batch.batch["values"]
+                            reward_tensor = discriminator_reward.clone()
+                            
+                            # 记录 discriminator reward 的统计信息
+                            disc_reward_sum = discriminator_reward.sum(dim=-1)  # 每个样本的总 reward
+                            format_metrics["reward/discriminator_mean"] = disc_reward_sum.mean().item()
+                            format_metrics["reward/discriminator_min"] = disc_reward_sum.min().item()
+                            format_metrics["reward/discriminator_max"] = disc_reward_sum.max().item()
+
+                            # Combine with format reward if available
+                            if format_reward_tensor is not None:
+                                # 安全获取 format_reward_weight，处理 OmegaConf 的各种情况
+                                format_weight = 0.3  # 默认值
+                                try:
+                                    _fw = getattr(self.config.trainer, "format_reward_weight", None)
+                                    if _fw is not None:
+                                        format_weight = float(_fw)
+                                except (ValueError, TypeError):
+                                    pass  # 使用默认值
+                                
+                                # 计算格式奖励的贡献
+                                format_contribution = format_weight * format_reward_tensor
+                                format_contrib_sum = format_contribution.sum(dim=-1)
+                                
+                                # 记录格式奖励的统计信息
+                                format_metrics["reward/format_contribution_mean"] = format_contrib_sum.mean().item()
+                                format_metrics["reward/format_contribution_min"] = format_contrib_sum.min().item()
+                                format_metrics["reward/format_contribution_max"] = format_contrib_sum.max().item()
+                                
+                                # 组合 reward
+                                reward_tensor = reward_tensor + format_contribution
+                                
+                                # 记录组合后的 reward 统计
+                                combined_reward_sum = reward_tensor.sum(dim=-1)
+                                format_metrics["reward/combined_mean"] = combined_reward_sum.mean().item()
+                                format_metrics["reward/combined_min"] = combined_reward_sum.min().item()
+                                format_metrics["reward/combined_max"] = combined_reward_sum.max().item()
+                                
+                                # 计算格式奖励占总 reward 的比例
+                                format_ratio = (format_contrib_sum.abs() / (combined_reward_sum.abs() + 1e-8)).mean().item()
+                                format_metrics["reward/format_ratio"] = format_ratio
+                                
+                                # 更新 metrics
+                                metrics.update(format_metrics)
+                                
+                                # 打印组合信息
+                                if self.global_steps % 10 == 0:
+                                    print(f"\n[Step {self.global_steps}] Reward Combination:")
+                                    print(f"  Discriminator: mean={disc_reward_sum.mean().item():.4f}, "
+                                          f"range=[{disc_reward_sum.min().item():.4f}, {disc_reward_sum.max().item():.4f}]")
+                                    print(f"  Format (weight={format_weight}): mean={format_contrib_sum.mean().item():.4f}, "
+                                          f"range=[{format_contrib_sum.min().item():.4f}, {format_contrib_sum.max().item():.4f}]")
+                                    print(f"  Combined: mean={combined_reward_sum.mean().item():.4f}, "
+                                          f"range=[{combined_reward_sum.min().item():.4f}, {combined_reward_sum.max().item():.4f}]")
+                                    print(f"  Format Ratio: {format_ratio*100:.2f}%\n")
+                            else:
+                                # 没有格式奖励时，也更新 metrics
+                                metrics.update(format_metrics)
+                                
                         elif reward_tensor is None:
                             # Fallback: should not happen if configuration is correct
                             raise RuntimeError(
@@ -1266,6 +1560,10 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # GAD warmup: use SFT loss on teacher response if warmup_use_sft is enabled
+                            warmup_use_sft = self.config.trainer.get("warmup_use_sft", False)
+                            if warmup_use_sft:
+                                batch.meta_info["use_sft_mode"] = True
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

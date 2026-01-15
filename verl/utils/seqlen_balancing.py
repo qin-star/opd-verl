@@ -284,13 +284,26 @@ def rearrange_micro_batches(
         List[List[int]]: index lists mapping each micro-batch back to original positions.
     """
     # this is per local micro_bsz
-    input_ids = batch["input_ids"]
+    # Support both student (input_ids) and teacher (teacher_input_ids) data
+    if "input_ids" in batch.keys():
+        input_ids = batch["input_ids"]
+    elif "teacher_input_ids" in batch.keys():
+        input_ids = batch["teacher_input_ids"]
+    else:
+        raise KeyError(f"Neither 'input_ids' nor 'teacher_input_ids' found in batch. Available keys: {list(batch.keys())}")
     if input_ids.is_nested:
         seq_len_effective: torch.Tensor = input_ids.offsets().diff()
         max_seq_len = max(seq_len_effective)
     else:
-        max_seq_len = batch["attention_mask"].shape[-1]
-        seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+        # Support both student (attention_mask) and teacher (teacher_attention_mask) data
+        if "attention_mask" in batch.keys():
+            attention_mask = batch["attention_mask"]
+        elif "teacher_attention_mask" in batch.keys():
+            attention_mask = batch["teacher_attention_mask"]
+        else:
+            raise KeyError(f"Neither 'attention_mask' nor 'teacher_attention_mask' found in batch.")
+        max_seq_len = attention_mask.shape[-1]
+        seq_len_effective: torch.Tensor = attention_mask.sum(dim=1)
 
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"

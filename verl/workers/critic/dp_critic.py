@@ -373,11 +373,12 @@ class DataParallelPPOCritic(BasePPOCritic):
                                 "critic/student_value_mean": student_score.mean().detach().item(),
                                 "critic/teacher_value_mean": teacher_score.mean().detach().item(),
                                 "critic/raw_score_diff": (teacher_score - student_score).mean().detach().item(),
-                                "critic/hinge_loss_lower": loss_info["hinge_loss_lower"],
-                                "critic/hinge_loss_upper": loss_info["hinge_loss_upper"],
                                 "critic/ranking_loss": loss_info["ranking_loss"],
                                 "critic/score_diff": loss_info["score_diff"],
                                 "critic/score_reg": loss_info.get("score_reg", 0.0),
+                                "critic/diff_penalty": loss_info.get("diff_penalty", 0.0),
+                                "critic/teacher_score_mean": loss_info.get("teacher_score_mean", 0.0),
+                                "critic/student_score_mean": loss_info.get("student_score_mean", 0.0),
                             }
                         )
                     else:

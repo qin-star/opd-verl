@@ -1396,19 +1396,26 @@ def compute_discriminator_loss(
     teacher_vpreds: torch.Tensor,
     response_mask: torch.Tensor,
     teacher_response_mask: torch.Tensor,
-    margin: float = 0.5,
+    margin: float = 0.5,  # 保留参数以保持接口兼容，但不再使用
 ) -> tuple:
     """
     Compute discriminator loss for GAD training.
     
-    The discriminator is trained to give higher scores to teacher responses
-    than student responses. This implementation uses:
-    1. Scaled logsigmoid loss (prevents gradient vanishing by normalizing the difference)
-    2. Margin-based hinge loss (ensures minimum separation between teacher and student)
+    改进版：移除了 hinge_loss_lower，允许 student 无限逼近 teacher。
     
-    Key insight: The original logsigmoid loss saturates when |diff| is large.
-    By normalizing to mean (instead of sum) and adding a hinge loss, we ensure
-    consistent gradients throughout training.
+    设计目标：
+    - 判别器学习区分 teacher 和 student 的能力
+    - 不设置人为的能力天花板，允许 student 达到甚至接近 teacher 水平
+    - 当 student 接近 teacher 时，ranking_loss 自然增大，推动判别器寻找更细微差别
+    
+    损失组件：
+    1. Ranking Loss: logsigmoid 软约束，提供持续的梯度信号
+    2. Score Regularization: 防止分数漂移到极端值
+    3. Over-confidence Penalty: 软约束，防止判别器过度自信导致梯度消失
+    
+    收敛状态：
+    - score_diff → 0: student 和 teacher 质量相当
+    - ranking_loss → log(2) ≈ 0.693: 判别器无法区分两者
     
     Args:
         student_vpreds (torch.Tensor):
@@ -1420,56 +1427,77 @@ def compute_discriminator_loss(
         teacher_response_mask (torch.Tensor):
             Mask for teacher responses, shape (batch_size, response_length).
         margin (float):
-            Target margin between teacher and student scores. Default 1.0.
+            Deprecated. Kept for API compatibility but no longer used.
     
     Returns:
         d_loss (torch.Tensor): Total discriminator loss.
         loss_info (dict): Dictionary containing individual loss components.
     """
-    # Compute sequence-level scores
-    # Raw scores (sum) for upper bound constraint - prevents score drift
+    # ==============================
+    # 1. 得分计算 (Score Computation)
+    # ==============================
+    
+    # Raw scores (sum) - 用于正则化约束，控制数值绝对量级
     teacher_score_raw = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)
     student_score_raw = torch.sum(student_vpreds * response_mask, dim=-1)
-    raw_diff = teacher_score_raw - student_score_raw
     
-    # Normalized scores (mean) for ranking loss - scale invariant
-    teacher_mask_sum = teacher_response_mask.sum(dim=-1).clamp(min=1)
-    student_mask_sum = response_mask.sum(dim=-1).clamp(min=1)
+    # Normalized scores (mean) - 用于核心对抗训练，防止通过生成更长句子欺骗判别器
+    eps = 1e-8
+    teacher_mask_sum = teacher_response_mask.sum(dim=-1).clamp(min=eps)
+    student_mask_sum = response_mask.sum(dim=-1).clamp(min=eps)
     teacher_score = teacher_score_raw / teacher_mask_sum
     student_score = student_score_raw / student_mask_sum
+    
+    # Relativistic difference: 判别器希望 teacher > student
     diff = teacher_score - student_score
     
-    # 1. Lower bound hinge loss: penalize when diff < margin (teacher not high enough)
-    hinge_loss_lower = torch.nn.functional.relu(margin - diff).mean()
+    # ==============================
+    # 2. 损失函数组件 (Loss Components)
+    # ==============================
     
-    # 2. Upper bound hinge loss: penalize when RAW diff > max_raw_diff (prevent runaway)
-    # This prevents the discriminator from pushing student score to -infinity
-    # Use RAW diff (not normalized) to directly constrain score magnitude
-    max_raw_diff = 20.0  # Limit raw score difference to prevent drift to extreme values
-    hinge_loss_upper = torch.nn.functional.relu(raw_diff - max_raw_diff).mean()
-    
-    # 3. Logsigmoid ranking loss with temperature scaling
-    # Scale down the difference to prevent saturation
-    temperature = 2.0  # Prevents saturation by scaling down large differences
+    # Component 1: Ranking Loss (平衡的 temperature)
+    # 公式：-log(sigmoid(teacher - student))
+    # 目标：d_acc 在 65-85% 之间，判别器能区分但不过度自信
+    # temperature=3.0 太大导致 d_acc=52%，temperature=1.0 太小导致 d_acc=99%
+    temperature = 2.0  # 折中值
     scaled_diff = diff / temperature
     scaled_diff = torch.clamp(scaled_diff, min=-10, max=10)
     ranking_loss = -torch.nn.functional.logsigmoid(scaled_diff).mean()
     
-    # 4. Score regularization: prevent RAW scores from drifting too far from zero
-    # This keeps the discriminator from collapsing to extreme values
-    # Use raw scores (not normalized) to directly penalize large absolute values
-    # Coefficient 0.001 because raw scores can be ~100x larger than normalized scores
-    score_reg = 0.001 * (teacher_score_raw.pow(2).mean() + student_score_raw.pow(2).mean())
+    # Component 2: Score Drift Regularization (数值漂移正则化)
+    # 目标：防止判别器输出值整体飘向正负无穷
+    # 0.01 太大导致判别器无法学习，恢复到适中值
+    score_reg = 0.005 * (teacher_score_raw.pow(2).mean() + student_score_raw.pow(2).mean())
     
-    # Combined loss with upper bound constraint and regularization
-    d_loss = hinge_loss_lower + hinge_loss_upper + 0.5 * ranking_loss + score_reg
+    # Component 3: Over-confidence Penalty (过度自信惩罚)
+    # 阈值 0.5 太小，恢复到 1.5，只在判别器过度自信时介入
+    diff_penalty = torch.nn.functional.relu(diff - 1.5).pow(2).mean()
     
+    # ==============================
+    # 3. 总损失聚合
+    # ==============================
+    # 注意：长度惩罚不应加在判别器 loss 上，原因：
+    # 1. 会与 max_response_length 截断冲突
+    # 2. 可能阻止 student 生成更详细的好回答
+    # 3. 长度惩罚应该加在 Actor 的 reward 上，而非 Critic 的 loss 上
+    # 
+    # 现有的归一化得分（mean 而非 sum）已经提供了基础的长度无关性
+    d_loss = 1.5 * ranking_loss + score_reg + 0.5 * diff_penalty
+    
+    # ==============================
+    # 4. 监控指标
+    # ==============================
     loss_info = {
-        "hinge_loss_lower": hinge_loss_lower.detach().item(),
-        "hinge_loss_upper": hinge_loss_upper.detach().item(),
         "ranking_loss": ranking_loss.detach().item(),
+        # 核心观察指标：score_diff
+        # 训练初期应该 > 0，随训练趋向 0 说明 student 正在成功模仿 teacher
+        # 如果 < 0，说明 student 在判别器眼里已超过 teacher
         "score_diff": diff.mean().detach().item(),
         "score_reg": score_reg.detach().item(),
+        "diff_penalty": diff_penalty.detach().item(),
+        # 观察绝对分值，确保没有发生数值漂移
+        "teacher_score_mean": teacher_score.mean().detach().item(),
+        "student_score_mean": student_score.mean().detach().item(),
     }
     
     return d_loss, loss_info
