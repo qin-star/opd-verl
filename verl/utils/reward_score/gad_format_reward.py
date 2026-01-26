@@ -169,12 +169,12 @@ def check_content_issues(text: str, ground_truth: str = "") -> Optional[Dict]:
     """检测内容问题（重复 + 长度 + 双重输出）"""
     # 1. 连续重复
     if re.search(r'(.{10,}?)\1{2,}', text):
-        return {"type": "repetition_consecutive", "penalty": 0.7}  # 从 0.5 提高到 0.7
+        return {"type": "repetition_consecutive", "penalty": 0.9}  # 从 0.7 提高到 0.9
     
     # 2. n-gram 重复
     rep_ratio = compute_ngram_repetition(text, ngram_size=4)
-    if rep_ratio > 0.30:  # 降低阈值，更早触发 (原 0.35)
-        penalty = min((rep_ratio - 0.30) * 1.2, 0.6)  # 增加系数和上限 (原 0.8, 0.4)
+    if rep_ratio > 0.25:  # 从 0.30 降低到 0.25，更早触发
+        penalty = min((rep_ratio - 0.25) * 1.5, 0.8)  # 系数从 1.2 提高到 1.5，上限从 0.6 提高到 0.8
         return {"type": "repetition_ngram", "ratio": round(rep_ratio, 3), "penalty": round(penalty, 3)}
     
     # 3. 双重输出（JSON 前有大段文本）
@@ -193,7 +193,7 @@ def check_content_issues(text: str, ground_truth: str = "") -> Optional[Dict]:
         ratio = len(text) / len(ground_truth)
         # 过长惩罚：更早触发，更强惩罚
         if ratio > 1.3:  # 从 1.5 降低到 1.3
-            penalty = min((ratio - 1.3) * 0.3, 0.7)  # 系数从 0.2 提高到 0.3，上限从 0.6 提高到 0.7
+            penalty = min((ratio - 1.3) * 0.5, 1)  # 系数从 0.2 提高到 0.3，上限从 0.6 提高到 0.7
             return {"type": "too_long", "ratio": round(ratio, 2), "penalty": round(penalty, 3)}
         elif ratio < 0.3:
             return {"type": "too_short", "ratio": round(ratio, 2), "penalty": 0.3}
@@ -253,8 +253,8 @@ def compute_format_score(solution_str: str, ground_truth: str = "") -> Dict[str,
         # 检测 JSON 值中的重复
         json_str = json.dumps(parsed_json, ensure_ascii=False)
         rep_ratio = compute_ngram_repetition(json_str, ngram_size=4)
-        if rep_ratio > 0.35:  # 降低阈值 (原 0.4)
-            penalty = min((rep_ratio - 0.35) * 1.2, 0.6)  # 增加系数和上限 (原 1.0, 0.5)
+        if rep_ratio > 0.30:  # 从 0.35 降低到 0.30
+            penalty = min((rep_ratio - 0.30) * 1.5, 0.8)  # 系数从 1.2 提高到 1.5，上限从 0.6 提高到 0.8
             score -= penalty
             penalties["json_repetition"] = {"ratio": round(rep_ratio, 3), "penalty": round(penalty, 3)}
     

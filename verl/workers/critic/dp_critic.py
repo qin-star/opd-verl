@@ -336,9 +336,19 @@ class DataParallelPPOCritic(BasePPOCritic):
                         teacher_response_length = teacher_response.size(1)
                         teacher_response_mask = teacher_attention_mask[:, -teacher_response_length:]
                         
-                        # Dual forward pass
-                        student_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
-                        teacher_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=True)
+                        # Randomized dual forward pass to prevent order dependency
+                        # Key insight: If critic always sees teacher after student, it may learn
+                        # to rely on the order rather than the content quality.
+                        # Solution: Randomly shuffle the forward order for each micro-batch.
+                        import random
+                        if random.random() < 0.5:
+                            # Order 1: Teacher first, then student
+                            teacher_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=True)
+                            student_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
+                        else:
+                            # Order 2: Student first, then teacher (original order)
+                            student_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=False)
+                            teacher_vpreds = self._forward_micro_batch(model_inputs, compute_teacher=True)
                         
                         # Compute sequence-level scores for accuracy calculation
                         # Note: vpreds already have last_token_mask applied, so sum gives the last token value
@@ -366,6 +376,10 @@ class DataParallelPPOCritic(BasePPOCritic):
                         
                         loss.backward()
                         
+                        # 计算长度信息（用于监控）
+                        student_lengths = response_mask.sum(dim=-1).float()
+                        teacher_lengths = teacher_response_mask.sum(dim=-1).float()
+                        
                         micro_batch_metrics.update(
                             {
                                 "critic/d_loss": d_loss.detach().item(),
@@ -379,6 +393,20 @@ class DataParallelPPOCritic(BasePPOCritic):
                                 "critic/diff_penalty": loss_info.get("diff_penalty", 0.0),
                                 "critic/teacher_score_mean": loss_info.get("teacher_score_mean", 0.0),
                                 "critic/student_score_mean": loss_info.get("student_score_mean", 0.0),
+                                # 简化的长度指标
+                                "critic/student_length": student_lengths.mean().detach().item(),
+                                "critic/teacher_length": teacher_lengths.mean().detach().item(),
+                                # 新增诊断指标
+                                "critic/score_diff_abs": torch.abs(teacher_score - student_score).mean().detach().item(),
+                                "critic/teacher_score_std": teacher_score.std().detach().item(),
+                                "critic/student_score_std": student_score.std().detach().item(),
+                                "critic/teacher_score_max": teacher_score.max().detach().item(),
+                                "critic/teacher_score_min": teacher_score.min().detach().item(),
+                                "critic/student_score_max": student_score.max().detach().item(),
+                                "critic/student_score_min": student_score.min().detach().item(),
+                                # 分数重叠度：衡量 teacher 和 student 分布的重叠程度
+                                "critic/score_overlap": ((teacher_score < student_score.mean()).float().mean() + 
+                                                        (student_score > teacher_score.mean()).float().mean()).detach().item() / 2,
                             }
                         )
                     else:

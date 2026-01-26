@@ -1413,7 +1413,7 @@ class RayPPOTrainer:
                         }
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
-                        batch = batch.uni
+                        batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1547,6 +1547,59 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # ==============================
+                        # 监控：长度-Reward相关性分析（每10步）
+                        # ==============================
+                        if self.use_critic and not self.use_rm and self.global_steps % 10 == 0:
+                            try:
+                                response_mask = batch.batch["response_mask"]
+                                token_level_scores = batch.batch["token_level_scores"]
+                                
+                                # 计算每个样本的长度和总reward
+                                response_lengths = response_mask.sum(dim=-1).float()
+                                sequence_rewards = token_level_scores.sum(dim=-1)
+                                
+                                # 计算相关系数
+                                if len(response_lengths) > 1:
+                                    stacked = torch.stack([response_lengths, sequence_rewards])
+                                    correlation_matrix = torch.corrcoef(stacked)
+                                    correlation = correlation_matrix[0, 1].item()
+                                    
+                                    # 添加到metrics（只保留关键指标）
+                                    metrics.update({
+                                        "length_reward/correlation": correlation,
+                                        "length_reward/length_mean": response_lengths.mean().item(),
+                                        "length_reward/reward_mean": sequence_rewards.mean().item(),
+                                    })
+                                    
+                                    # 动态阈值：根据训练阶段调整
+                                    if self.global_steps < 100:
+                                        # 训练初期：宽松（Critic还在学习）
+                                        warn_th, alert_th = 0.30, 0.50
+                                    elif self.global_steps < 500:
+                                        # 训练中期：标准
+                                        warn_th, alert_th = 0.20, 0.35
+                                    else:
+                                        # 训练后期：严格（应该已经学会长度无关）
+                                        warn_th, alert_th = 0.15, 0.25
+                                    
+                                    # 判断状态
+                                    abs_corr = abs(correlation)
+                                    if abs_corr < warn_th:
+                                        status_emoji = "✅"
+                                    elif abs_corr < alert_th:
+                                        status_emoji = "⚠️"
+                                    else:
+                                        status_emoji = "❌"
+                                    
+                                    # 简化打印：单行显示关键信息
+                                    print(f"[Step {self.global_steps}] Len-Reward Corr: {correlation:+.3f} {status_emoji} "
+                                          f"(th: {warn_th:.2f}/{alert_th:.2f}) | "
+                                          f"Len: {response_lengths.mean():.1f} | Reward: {sequence_rewards.mean():.3f}")
+                                    
+                            except Exception as e:
+                                print(f"[Warning] Length-Reward correlation failed: {e}")
 
                     # update critic
                     if self.use_critic:
