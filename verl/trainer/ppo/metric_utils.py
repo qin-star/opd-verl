@@ -157,55 +157,31 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         raise ValueError("All samples are aborted, this should not happen.")
 
     metrics = {
-        # score
+        # score (只保留 mean)
         "critic/score/mean": score_mean,
-        "critic/score/max": score_max,
-        "critic/score/min": score_min,
-        # reward
+        # reward (只保留 mean)
         "critic/rewards/mean": reward_mean,
-        "critic/rewards/max": reward_max,
-        "critic/rewards/min": reward_min,
-        # adv
+        # adv (只保留 mean)
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
-        # returns
+        # returns (只保留 mean)
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
         **(
             {
-                # values
+                # values (只保留 mean)
                 "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
-                # vf explained var
+                # vf explained var (核心指标)
                 "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
             }
             if use_critic
             else {}
         ),
-        # response length
-        "response_length/mean": torch.mean(response_length).detach().item(),
-        "response_length/max": torch.max(response_length).detach().item(),
-        "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
-        .detach()
-        .item(),
-        # response length (non-aborted only)
-        # These statistics exclude aborted samples to avoid skew from zeros
+        # response length (只保留 non-aborted 版本)
         "response_length_non_aborted/mean": non_aborted_response_length_mean,
-        "response_length_non_aborted/max": non_aborted_response_length_max,
-        "response_length_non_aborted/min": non_aborted_response_length_min,
         "response_length_non_aborted/clip_ratio": non_aborted_response_length_clip_ratio,
-        # aborted ratio
-        # Fraction of samples whose response length is zero
+        # aborted ratio (核心指标)
         "response/aborted_ratio": aborted_ratio,
-        # prompt length
+        # prompt length (只保留 mean)
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
-        "prompt_length/max": torch.max(prompt_length).detach().item(),
-        "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
 
     # multi-turn conversation

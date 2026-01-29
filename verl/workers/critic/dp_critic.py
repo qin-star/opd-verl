@@ -49,6 +49,74 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
+    
+    def _compute_last_token_mask(self, responses, response_mask, compute_teacher=False):
+        """
+        计算 last token mask，智能跳过 EOS token
+        
+        关键修复：如果最后一个 token 是 EOS，使用倒数第二个 token
+        这解决了 Student (含EOS) 和 Teacher (不含EOS) 提取不同 token 的问题
+        
+        Args:
+            responses: response token IDs, shape (batch, seq_len)
+            response_mask: response attention mask, shape (batch, seq_len)
+            compute_teacher: 是否是 teacher response
+        
+        Returns:
+            last_token_mask: bool tensor, shape (batch, seq_len)
+        """
+        batch_size = response_mask.size(0)
+        response_lengths = response_mask.sum(dim=1).long()
+        
+        # 初始的 last token 索引
+        last_token_indices = response_lengths - 1
+        
+        # 获取最后一个有效 token 的 ID
+        batch_indices = torch.arange(batch_size, device=response_mask.device)
+        
+        # 安全地获取 last token IDs（避免索引越界）
+        valid_indices = last_token_indices.clamp(min=0, max=responses.size(1) - 1)
+        last_token_ids = responses[batch_indices, valid_indices]
+        
+        # 获取 EOS token ID
+        if hasattr(self, '_tokenizer') and self._tokenizer is not None:
+            eos_token_id = self._tokenizer.eos_token_id
+        else:
+            # Qwen 系列的 EOS token ID
+            eos_token_id = 151645
+        
+        # 检查是否是 EOS token
+        is_eos = (last_token_ids == eos_token_id)
+        
+        # 统计信息（用于调试，可选）
+        if torch.any(is_eos):
+            eos_count = is_eos.sum().item()
+            # 只在第一次或偶尔打印，避免日志过多
+            if not hasattr(self, '_eos_warning_shown'):
+                self._eos_warning_shown = True
+                logger.info(f"{'Teacher' if compute_teacher else 'Student'} responses: "
+                           f"{eos_count}/{batch_size} samples have EOS token at the end")
+        
+        # 如果最后一个是 EOS，使用倒数第二个 token
+        # 确保索引有效（至少为 0）
+        adjusted_indices = torch.where(
+            is_eos,
+            (last_token_indices - 1).clamp(min=0),
+            last_token_indices
+        )
+        
+        # 额外检查：如果 response 只有 1 个 token 且是 EOS，使用该 token
+        # （虽然这种情况不应该发生，但为了健壮性）
+        single_token_eos = (response_lengths == 1) & is_eos
+        if torch.any(single_token_eos):
+            logger.warning(f"Found {single_token_eos.sum().item()} responses with only EOS token")
+            adjusted_indices = torch.where(single_token_eos, last_token_indices, adjusted_indices)
+        
+        # 创建 mask
+        last_token_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+        last_token_mask[batch_indices, adjusted_indices] = True
+        
+        return last_token_mask
 
     def _forward_micro_batch(self, micro_batch, compute_teacher=False):
         # Determine which data to use based on compute_teacher flag
@@ -133,13 +201,13 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # For sequence-level reward model: extract current token values
                 values = values[:, -response_length:]
                 
-                # Apply last token mask for sequence-level scoring
+                # Apply last token mask for sequence-level scoring (跳过 EOS token)
                 response_mask = attention_mask[:, -response_length:]
-                response_lengths = response_mask.sum(dim=1).long()
-                last_token_indices = response_lengths - 1
-                last_token_mask = torch.zeros_like(response_mask, dtype=torch.bool)
-                batch_indices = torch.arange(response_mask.size(0), device=response_mask.device)
-                last_token_mask[batch_indices, last_token_indices] = True
+                if compute_teacher:
+                    responses_for_mask = micro_batch["teacher_response"]
+                else:
+                    responses_for_mask = micro_batch["responses"]
+                last_token_mask = self._compute_last_token_mask(responses_for_mask, response_mask, compute_teacher)
                 values = values * last_token_mask.type_as(values)
             else:
                 output = self.critic_module(
@@ -159,13 +227,13 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # Squeeze the last dimension if num_labels=1
                 values = values[:, -response_length:].squeeze(-1)  # (batch, response_length)
                 
-                # Apply last token mask for sequence-level scoring
+                # Apply last token mask for sequence-level scoring (跳过 EOS token)
                 response_mask = attention_mask[:, -response_length:]
-                response_lengths = response_mask.sum(dim=1).long()
-                last_token_indices = response_lengths - 1
-                last_token_mask = torch.zeros_like(response_mask, dtype=torch.bool)
-                batch_indices = torch.arange(response_mask.size(0), device=response_mask.device)
-                last_token_mask[batch_indices, last_token_indices] = True
+                if compute_teacher:
+                    responses_for_mask = micro_batch["teacher_response"]
+                else:
+                    responses_for_mask = micro_batch["responses"]
+                last_token_mask = self._compute_last_token_mask(responses_for_mask, response_mask, compute_teacher)
                 values = values * last_token_mask.type_as(values)
             return values
 
@@ -200,20 +268,317 @@ class DataParallelPPOCritic(BasePPOCritic):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
+        # 优化：记录裁剪前的梯度范数
         if isinstance(self.critic_module, FSDP):
+            # 计算裁剪前的梯度范数
+            grad_norm_before_clip = sum(
+                p.grad.data.norm(2).item() ** 2 
+                for p in self.critic_module.parameters() 
+                if p.grad is not None
+            ) ** 0.5
             grad_norm = self.critic_module.clip_grad_norm_(self.config.grad_clip)
         elif isinstance(self.critic_module, FSDPModule):
+            # 计算裁剪前的梯度范数
+            grad_norm_before_clip = sum(
+                p.grad.data.norm(2).item() ** 2 
+                for p in self.critic_module.parameters() 
+                if p.grad is not None
+            ) ** 0.5
             grad_norm = fsdp2_clip_grad_norm_(self.critic_module.parameters(), max_norm=self.config.grad_clip)
         else:
+            # 计算裁剪前的梯度范数
+            grad_norm_before_clip = sum(
+                p.grad.data.norm(2).item() ** 2 
+                for p in self.critic_module.parameters() 
+                if p.grad is not None
+            ) ** 0.5
             grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_module.parameters(), max_norm=self.config.grad_clip)
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.critic_optimizer.zero_grad()
+            return grad_norm, grad_norm_before_clip
         else:
             self.critic_optimizer.step()
-        return grad_norm
+        return grad_norm, grad_norm_before_clip
+
+    def _log_scoring_details(self, model_inputs, teacher_score, student_score, 
+                            response_mask, teacher_response_mask, step):
+        """
+        记录详细的打分信息，用于人工监控 Critic 的打分是否准确
+        
+        每 10 步记录一次，显示：
+        - 当前 prompt
+        - 所有 student responses 及其分数
+        - Teacher response 及其分数
+        - 分数差异
+        
+        日志会保存到文件和控制台
+        """
+        # 只在 rank 0 记录，避免多进程重复
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+        except:
+            pass
+        
+        # 初始化详细日志记录器（只初始化一次）
+        if not hasattr(self, '_detail_logger'):
+            import logging
+            from datetime import datetime
+            
+            # 创建专门的详细日志记录器
+            self._detail_logger = logging.getLogger('critic_scoring_details')
+            self._detail_logger.setLevel(logging.INFO)
+            
+            # 避免重复添加 handler
+            if not self._detail_logger.handlers:
+                # 创建日志目录
+                log_dir = os.path.join(os.getcwd(), 'logs', 'critic_scoring_details')
+                os.makedirs(log_dir, exist_ok=True)
+                
+                # 创建文件 handler（带时间戳）
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                log_file = os.path.join(log_dir, f'scoring_details_{timestamp}.log')
+                file_handler = logging.FileHandler(log_file, encoding='utf-8')
+                file_handler.setLevel(logging.INFO)
+                
+                # 创建控制台 handler
+                console_handler = logging.StreamHandler()
+                console_handler.setLevel(logging.INFO)
+                
+                # 设置格式（简洁格式，不需要时间戳，因为我们自己会记录 step）
+                formatter = logging.Formatter('%(message)s')
+                file_handler.setFormatter(formatter)
+                console_handler.setFormatter(formatter)
+                
+                self._detail_logger.addHandler(file_handler)
+                self._detail_logger.addHandler(console_handler)
+                
+                # 记录日志文件位置
+                logger.info(f"Critic scoring details will be saved to: {log_file}")
+        
+        try:
+            # 获取 tokenizer（如果可用）
+            from transformers import AutoTokenizer
+            if not hasattr(self, '_tokenizer'):
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    self.config.model.path if hasattr(self.config.model, 'path') else 'Qwen/Qwen2.5-7B',
+                    trust_remote_code=True
+                )
+            tokenizer = self._tokenizer
+        except Exception as e:
+            # 如果无法加载 tokenizer，跳过记录
+            logger.warning(f"Failed to load tokenizer for scoring details: {e}")
+            return
+        
+        # 构建完整的输出字符串
+        output_lines = []
+        output_lines.append("\n" + "="*100)
+        output_lines.append(f"📊 Critic 打分详情 - Step {step}")
+        output_lines.append("="*100)
+        
+        try:
+            batch_size = teacher_score.size(0)
+            
+            # 添加批次信息诊断
+            output_lines.append(f"\n🔍 批次信息:")
+            output_lines.append(f"  总样本数: {batch_size}")
+            output_lines.append(f"  Input IDs shape: {model_inputs['input_ids'].shape}")
+            output_lines.append(f"  Responses shape: {model_inputs['responses'].shape}")
+            output_lines.append(f"  Teacher response shape: {model_inputs['teacher_response'].shape}")
+            output_lines.append("")
+            
+            # 只显示前 2 组样本（每组包含 prompt + student response + teacher response）
+            num_samples_to_show = min(2, batch_size)
+            
+            for sample_idx in range(num_samples_to_show):
+                output_lines.append("\n" + "="*100)
+                output_lines.append(f"� 样本 #{sample_idx + 1}")
+                output_lines.append("="*100)
+                
+                # 解码 prompt（从 input_ids 中提取，去掉 response 部分）
+                input_ids = model_inputs["input_ids"][sample_idx].cpu()
+                responses = model_inputs["responses"][sample_idx].cpu()
+                attention_mask = model_inputs["attention_mask"][sample_idx].cpu()
+                
+                # 计算 prompt 长度
+                response_length = responses.size(0)
+                prompt_length = input_ids.size(0) - response_length
+                prompt_ids = input_ids[:prompt_length]
+                
+                # 解码 prompt（完整显示，不截断）
+                prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                
+                output_lines.append(f"\n📝 Prompt:")
+                output_lines.append(f"  {prompt_text}")
+                output_lines.append("")
+                
+                # 显示对应的 student response
+                output_lines.append(f"🎓 Student Response:")
+                output_lines.append("-" * 100)
+                
+                response_ids = model_inputs["responses"][sample_idx].cpu()
+                response_mask_i = response_mask[sample_idx].cpu()
+                
+                # 只解码有效的 tokens 
+                valid_length = response_mask_i.sum().item()
+                valid_response_ids = response_ids[:int(valid_length)]
+                
+                response_text = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+                score = student_score[sample_idx].item()
+                
+                output_lines.append(f"  Score: {score:7.4f} | Length: {int(valid_length):3d}")
+                output_lines.append(f"  Text: {response_text}")
+                output_lines.append(f"  Tokens: {valid_response_ids.tolist()}")
+                output_lines.append("")
+                
+                # 显示对应的 teacher response
+                output_lines.append(f"👨‍🏫 Teacher Response:")
+                output_lines.append("-" * 100)
+                
+                teacher_response_ids = model_inputs["teacher_response"][sample_idx].cpu()
+                teacher_mask = teacher_response_mask[sample_idx].cpu()
+                valid_length = teacher_mask.sum().item()
+                valid_teacher_ids = teacher_response_ids[:int(valid_length)]
+                
+                teacher_text = tokenizer.decode(valid_teacher_ids, skip_special_tokens=True)
+                teacher_score_val = teacher_score[sample_idx].item()
+                
+                output_lines.append(f"  Score: {teacher_score_val:7.4f} | Length: {int(valid_length):3d}")
+                output_lines.append(f"  Text: {teacher_text}")
+                output_lines.append(f"  Tokens: {valid_teacher_ids.tolist()}")
+                output_lines.append("")
+                
+                # 显示分数对比
+                score_diff = teacher_score_val - score
+                output_lines.append(f"📊 分数对比:")
+                output_lines.append(f"  Teacher - Student = {score_diff:7.4f}")
+                output_lines.append(f"  Teacher > Student: {'✅ 正确' if teacher_score_val > score else '❌ 错误' if teacher_score_val < score else '⚖️  相等'}")
+                
+                # 检查内容相似度（简单的文本匹配）
+                if teacher_text.strip() == response_text.strip():
+                    # 检查 token 长度是否相同
+                    student_token_len = len(valid_response_ids.tolist())
+                    teacher_token_len = len(valid_teacher_ids.tolist())
+                    
+                    # 只有当分数差异显著时才警告
+                    if abs(score_diff) > 0.5:
+                        output_lines.append(f"  ⚠️  警告: Teacher 和 Student 回答完全相同，但分数差异为 {abs(score_diff):.4f}!")
+                        
+                        if student_token_len != teacher_token_len:
+                            output_lines.append(f"  🚨 关键发现: 相同文本但 token 长度不同!")
+                            output_lines.append(f"     Student tokens: {student_token_len}")
+                            output_lines.append(f"     Teacher tokens: {teacher_token_len}")
+                            output_lines.append(f"     这可能是分数差异的根本原因！")
+                    elif student_token_len != teacher_token_len:
+                        # 分数相同但长度不同，说明修复生效
+                        output_lines.append(f"  ✅ 相同文本，分数一致 (分差: {abs(score_diff):.4f})")
+                        output_lines.append(f"  📝 注: Student 包含 EOS token ({student_token_len} tokens)，Teacher 不包含 ({teacher_token_len} tokens)")
+                        output_lines.append(f"     EOS token 已被正确跳过，提取了相同位置的 token")
+                    else:
+                        # 完美情况：长度和分数都相同
+                        output_lines.append(f"  ✅ 完美: 相同文本，相同长度，相同分数")
+            
+            output_lines.append("\n" + "="*100)
+            
+            # 全局统计信息
+            output_lines.append(f"\n� 全局统计信息 (共 {batch_size} 个样本):")
+            output_lines.append("-" * 100)
+            output_lines.append(f"  Teacher 平均分: {teacher_score.mean().item():7.4f}")
+            output_lines.append(f"  Student 平均分: {student_score.mean().item():7.4f}")
+            output_lines.append(f"  平均分差:       {(teacher_score - student_score).mean().item():7.4f}")
+            output_lines.append(f"  Teacher > Student: {(teacher_score > student_score).float().mean().item()*100:.1f}%")
+            
+            # 显示分数分布
+            output_lines.append(f"\n  Student 分数范围: [{student_score.min().item():.4f}, {student_score.max().item():.4f}]")
+            output_lines.append(f"  Teacher 分数范围: [{teacher_score.min().item():.4f}, {teacher_score.max().item():.4f}]")
+            
+            # 检查相同答案的分数差异（诊断顺序依赖问题）
+            same_answer_count = 0
+            same_answer_score_diffs = []
+            for i in range(batch_size):
+                try:
+                    student_text = tokenizer.decode(
+                        model_inputs["responses"][i].cpu()[:int(response_mask[i].sum().item())],
+                        skip_special_tokens=True
+                    ).strip()
+                    teacher_text = tokenizer.decode(
+                        model_inputs["teacher_response"][i].cpu()[:int(teacher_response_mask[i].sum().item())],
+                        skip_special_tokens=True
+                    ).strip()
+                    
+                    if student_text == teacher_text and len(student_text) > 0:
+                        same_answer_count += 1
+                        score_diff = abs(teacher_score[i].item() - student_score[i].item())
+                        same_answer_score_diffs.append(score_diff)
+                except:
+                    pass
+            
+            if same_answer_count > 0:
+                avg_diff = sum(same_answer_score_diffs) / len(same_answer_score_diffs)
+                output_lines.append(f"\n⚠️  顺序依赖诊断:")
+                output_lines.append(f"  相同答案数量: {same_answer_count}/{batch_size}")
+                output_lines.append(f"  相同答案的平均分差: {avg_diff:.4f}")
+                
+                # 更新警告阈值：修复后应该 < 0.5
+                if avg_diff > 1.0:
+                    output_lines.append(f"  🚨 警告: 相同答案分差过大 (>{avg_diff:.2f})，可能存在严重的顺序依赖问题!")
+                elif avg_diff > 0.5:
+                    output_lines.append(f"  ⚠️  注意: 相同答案分差略高 ({avg_diff:.2f})，建议继续观察")
+                else:
+                    output_lines.append(f"  ✅ 良好: 相同答案分差很小 ({avg_diff:.2f})，EOS token 修复生效!")
+            
+        except Exception as e:
+            output_lines.append(f"  ⚠️  记录详情时出错: {e}")
+            import traceback
+            output_lines.append(f"  错误堆栈: {traceback.format_exc()}")
+            logger.warning(f"Error in _log_scoring_details: {e}")
+        
+        output_lines.append("\n" + "="*100 + "\n")
+        
+        # 使用 logger 记录（会同时输出到文件和控制台）
+        self._detail_logger.info("\n".join(output_lines))
+
+    def _optimizer_step(self):
+        assert self.config.grad_clip is not None
+
+        # 优化：记录裁剪前的梯度范数
+        if isinstance(self.critic_module, FSDP):
+            # 计算裁剪前的梯度范数
+            grad_norm_before_clip = sum(
+                p.grad.data.norm(2).item() ** 2 
+                for p in self.critic_module.parameters() 
+                if p.grad is not None
+            ) ** 0.5
+            grad_norm = self.critic_module.clip_grad_norm_(self.config.grad_clip)
+        elif isinstance(self.critic_module, FSDPModule):
+            # 计算裁剪前的梯度范数
+            grad_norm_before_clip = sum(
+                p.grad.data.norm(2).item() ** 2 
+                for p in self.critic_module.parameters() 
+                if p.grad is not None
+            ) ** 0.5
+            grad_norm = fsdp2_clip_grad_norm_(self.critic_module.parameters(), max_norm=self.config.grad_clip)
+        else:
+            # 计算裁剪前的梯度范数
+            grad_norm_before_clip = sum(
+                p.grad.data.norm(2).item() ** 2 
+                for p in self.critic_module.parameters() 
+                if p.grad is not None
+            ) ** 0.5
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_module.parameters(), max_norm=self.config.grad_clip)
+
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.critic_optimizer.zero_grad()
+            return grad_norm, grad_norm_before_clip
+        else:
+            self.critic_optimizer.step()
+        return grad_norm, grad_norm_before_clip
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def compute_values(self, data: DataProto) -> torch.Tensor:
@@ -283,6 +648,11 @@ class DataParallelPPOCritic(BasePPOCritic):
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
+        
+        # 添加全局步数计数器（用于控制打印频率）
+        if not hasattr(self, '_update_step'):
+            self._update_step = 0
+        self._update_step += 1
         
         # Check if using GAD discriminator training
         use_discriminator = "teacher_response" in data.batch
@@ -355,17 +725,82 @@ class DataParallelPPOCritic(BasePPOCritic):
                         teacher_score = teacher_vpreds.sum(dim=-1)  # Last token value (others are 0)
                         student_score = student_vpreds.sum(dim=-1)  # Last token value (others are 0)
                         
+                        # 每 5 步打印详细的打分信息（用于人工监控）
+                        if self._update_step % 5 == 0 and batch_idx == 0:
+                            self._log_scoring_details(
+                                model_inputs=model_inputs,
+                                teacher_score=teacher_score,
+                                student_score=student_score,
+                                response_mask=response_mask,
+                                teacher_response_mask=teacher_response_mask,
+                                step=self._update_step
+                            )
+                        
                         # Compute discriminator accuracy (per-sample comparison)
                         # For GAD: teacher should score higher than student
                         d_acc = (teacher_score > student_score).float().mean()
                         
                         # Compute discriminator loss (now returns tuple with loss_info)
+                        # 优化 2026-01-28：
+                        # 1. 增大 temperature 从 0.5 到 5.0，缓解梯度饱和
+                        # 2. 关闭自适应 temperature，使用固定值
+                        # 3. 启用 batch normalization，稳定训练
                         d_loss, loss_info = core_algos.compute_discriminator_loss(
                             student_vpreds=student_vpreds,
                             teacher_vpreds=teacher_vpreds,
                             response_mask=response_mask,
                             teacher_response_mask=teacher_response_mask,
+                            temperature=5.0,  # 从 0.5 增大到 5.0
+                            adaptive_temperature=False,  # 关闭自适应，使用固定值
+                            use_batch_norm=True,  # 启用 batch normalization
                         )
+                        
+                        # 添加一致性损失：惩罚相同内容的分数差异
+                        # 这是解决顺序依赖问题的关键
+                        consistency_loss = torch.tensor(0.0, device=teacher_score.device)
+                        consistency_count = 0
+                        
+                        # 检查哪些样本的 student 和 teacher response 完全相同
+                        if hasattr(self, '_tokenizer'):
+                            try:
+                                for i in range(teacher_score.size(0)):
+                                    # 解码 student response
+                                    student_response_ids = model_inputs["responses"][i]
+                                    student_mask_i = response_mask[i]
+                                    student_valid_len = int(student_mask_i.sum().item())
+                                    student_text = self._tokenizer.decode(
+                                        student_response_ids[:student_valid_len].cpu(),
+                                        skip_special_tokens=True
+                                    ).strip()
+                                    
+                                    # 解码 teacher response
+                                    teacher_response_ids = model_inputs["teacher_response"][i]
+                                    teacher_mask_i = teacher_response_mask[i]
+                                    teacher_valid_len = int(teacher_mask_i.sum().item())
+                                    teacher_text = self._tokenizer.decode(
+                                        teacher_response_ids[:teacher_valid_len].cpu(),
+                                        skip_special_tokens=True
+                                    ).strip()
+                                    
+                                    # 如果文本完全相同，添加一致性约束
+                                    if student_text == teacher_text and len(student_text) > 0:
+                                        score_diff = (teacher_score[i] - student_score[i]) ** 2
+                                        consistency_loss += score_diff
+                                        consistency_count += 1
+                            except Exception as e:
+                                # 如果解码失败，跳过一致性损失
+                                logger.warning(f"Failed to compute consistency loss: {e}")
+                        
+                        # 归一化并添加到总损失
+                        if consistency_count > 0:
+                            consistency_loss = consistency_loss / consistency_count
+                            # 一致性损失权重：1.0（与 ranking loss 同等重要）
+                            d_loss = d_loss + 1.0 * consistency_loss
+                            loss_info["consistency_loss"] = consistency_loss.detach().item()
+                            loss_info["consistency_count"] = consistency_count
+                        else:
+                            loss_info["consistency_loss"] = 0.0
+                            loss_info["consistency_count"] = 0
                         
                         if self.config.use_dynamic_bsz:
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -380,33 +815,38 @@ class DataParallelPPOCritic(BasePPOCritic):
                         student_lengths = response_mask.sum(dim=-1).float()
                         teacher_lengths = teacher_response_mask.sum(dim=-1).float()
                         
+                        # 优化后的指标（方案 A - 精简版）：从 30 个减少到 15 个核心指标
+                        # 删除冗余：student_value_mean, teacher_value_mean, raw_score_diff (重复)
+                        # 删除低价值：score_diff_abs, p25/p75 分位数, score_overlap, min/max
                         micro_batch_metrics.update(
                             {
+                                # 核心指标（6 个）
                                 "critic/d_loss": d_loss.detach().item(),
                                 "critic/d_acc": d_acc.detach().item(),
-                                "critic/student_value_mean": student_score.mean().detach().item(),
-                                "critic/teacher_value_mean": teacher_score.mean().detach().item(),
-                                "critic/raw_score_diff": (teacher_score - student_score).mean().detach().item(),
                                 "critic/ranking_loss": loss_info["ranking_loss"],
-                                "critic/score_diff": loss_info["score_diff"],
                                 "critic/score_reg": loss_info.get("score_reg", 0.0),
-                                "critic/diff_penalty": loss_info.get("diff_penalty", 0.0),
+                                "critic/score_diff": loss_info["score_diff"],
+                                "critic/temperature": loss_info.get("temperature", 1.0),
+                                
+                                # 分数统计（4 个）- 保留均值和标准差，删除 min/max/p25/p75
                                 "critic/teacher_score_mean": loss_info.get("teacher_score_mean", 0.0),
                                 "critic/student_score_mean": loss_info.get("student_score_mean", 0.0),
-                                # 简化的长度指标
-                                "critic/student_length": student_lengths.mean().detach().item(),
-                                "critic/teacher_length": teacher_lengths.mean().detach().item(),
-                                # 新增诊断指标
-                                "critic/score_diff_abs": torch.abs(teacher_score - student_score).mean().detach().item(),
                                 "critic/teacher_score_std": teacher_score.std().detach().item(),
                                 "critic/student_score_std": student_score.std().detach().item(),
-                                "critic/teacher_score_max": teacher_score.max().detach().item(),
-                                "critic/teacher_score_min": teacher_score.min().detach().item(),
-                                "critic/student_score_max": student_score.max().detach().item(),
-                                "critic/student_score_min": student_score.min().detach().item(),
-                                # 分数重叠度：衡量 teacher 和 student 分布的重叠程度
-                                "critic/score_overlap": ((teacher_score < student_score.mean()).float().mean() + 
-                                                        (student_score > teacher_score.mean()).float().mean()).detach().item() / 2,
+                                
+                                # 长度相关（3 个）
+                                "critic/teacher_length": loss_info.get("teacher_length_mean", teacher_lengths.mean().detach().item()),
+                                "critic/student_length": loss_info.get("student_length_mean", student_lengths.mean().detach().item()),
+                                "critic/length_ratio": loss_info.get("length_ratio", 1.0),
+                                
+                                # 归一化对比（2 个）- 用于监控混合策略效果
+                                "critic/score_raw_diff": loss_info.get("score_raw_diff", 0.0),
+                                "critic/score_norm_diff": loss_info.get("score_norm_diff", 0.0),
+                                
+                                # 高级指标（2 个）- 用于诊断训练质量
+                                "critic/score_separation": ((teacher_score.mean() - student_score.mean()) / 
+                                                           (teacher_score.std() + student_score.std() + 1e-8)).detach().item(),
+                                "critic/hard_samples_ratio": (torch.abs(teacher_score - student_score) < 0.1).float().mean().detach().item(),
                             }
                         )
                     else:
@@ -443,8 +883,13 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"critic/grad_norm": grad_norm.detach().item()}
+                grad_norm, grad_norm_before_clip = self._optimizer_step()
+                # 梯度指标（2 个）- 保留最关键的梯度监控信息
+                # 删除：grad_clip_ratio, effective_gradient（可以从其他指标推导）
+                mini_batch_metrics = {
+                    "critic/grad_norm": grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm,
+                    "critic/grad_norm_before_clip": grad_norm_before_clip,
+                }
                 append_to_dict(metrics, mini_batch_metrics)
         self.critic_optimizer.zero_grad()
         return metrics

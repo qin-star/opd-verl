@@ -1339,10 +1339,8 @@ class RayPPOTrainer:
                                 avg_format_score = sum(format_scores) / len(format_scores) if format_scores else 0
                                 num_with_penalties = sum(1 for p in format_penalties_list if p)
                                 
-                                # 基础指标
+                                # 基础指标（移除 min/max）
                                 format_metrics["format/reward_avg"] = avg_format_score
-                                format_metrics["format/reward_min"] = min(format_scores) if format_scores else 0
-                                format_metrics["format/reward_max"] = max(format_scores) if format_scores else 0
                                 format_metrics["format/penalty_ratio"] = num_with_penalties / len(format_scores) if format_scores else 0
                                 
                                 # 各类惩罚的比例
@@ -1447,11 +1445,9 @@ class RayPPOTrainer:
                             discriminator_reward = batch.batch["values"]
                             reward_tensor = discriminator_reward.clone()
                             
-                            # 记录 discriminator reward 的统计信息
+                            # 记录 discriminator reward 的统计信息（只保留 mean）
                             disc_reward_sum = discriminator_reward.sum(dim=-1)  # 每个样本的总 reward
                             format_metrics["reward/discriminator_mean"] = disc_reward_sum.mean().item()
-                            format_metrics["reward/discriminator_min"] = disc_reward_sum.min().item()
-                            format_metrics["reward/discriminator_max"] = disc_reward_sum.max().item()
 
                             # Combine with format reward if available
                             if format_reward_tensor is not None:
@@ -1468,19 +1464,15 @@ class RayPPOTrainer:
                                 format_contribution = format_weight * format_reward_tensor
                                 format_contrib_sum = format_contribution.sum(dim=-1)
                                 
-                                # 记录格式奖励的统计信息
+                                # 记录格式奖励的统计信息（只保留 mean）
                                 format_metrics["reward/format_contribution_mean"] = format_contrib_sum.mean().item()
-                                format_metrics["reward/format_contribution_min"] = format_contrib_sum.min().item()
-                                format_metrics["reward/format_contribution_max"] = format_contrib_sum.max().item()
                                 
                                 # 组合 reward
                                 reward_tensor = reward_tensor + format_contribution
                                 
-                                # 记录组合后的 reward 统计
+                                # 记录组合后的 reward 统计（只保留 mean）
                                 combined_reward_sum = reward_tensor.sum(dim=-1)
                                 format_metrics["reward/combined_mean"] = combined_reward_sum.mean().item()
-                                format_metrics["reward/combined_min"] = combined_reward_sum.min().item()
-                                format_metrics["reward/combined_max"] = combined_reward_sum.max().item()
                                 
                                 # 计算格式奖励占总 reward 的比例
                                 format_ratio = (format_contrib_sum.abs() / (combined_reward_sum.abs() + 1e-8)).mean().item()
@@ -1489,7 +1481,7 @@ class RayPPOTrainer:
                                 # 更新 metrics
                                 metrics.update(format_metrics)
                                 
-                                # 打印组合信息
+                                # 打印组合信息（保留详细信息用于调试）
                                 if self.global_steps % 10 == 0:
                                     print(f"\n[Step {self.global_steps}] Reward Combination:")
                                     print(f"  Discriminator: mean={disc_reward_sum.mean().item():.4f}, "
@@ -1569,8 +1561,6 @@ class RayPPOTrainer:
                                     # 添加到metrics（只保留关键指标）
                                     metrics.update({
                                         "length_reward/correlation": correlation,
-                                        "length_reward/length_mean": response_lengths.mean().item(),
-                                        "length_reward/reward_mean": sequence_rewards.mean().item(),
                                     })
                                     
                                     # 动态阈值：根据训练阶段调整
