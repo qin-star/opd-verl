@@ -201,14 +201,45 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # For sequence-level reward model: extract current token values
                 values = values[:, -response_length:]
                 
-                # Apply last token mask for sequence-level scoring (跳过 EOS token)
+                # 🔧 修改：使用平均值而非 last token
+                # 原因：last token 机制导致 Critic 无法理解语义，只是比较随机的 token value
+                # 平均值机制强制模型通过梯度反向传播学习整个序列的语义
                 response_mask = attention_mask[:, -response_length:]
+                
+                # 🔧 关键修复：显式排除 EOS token
+                # 问题：response_mask 包含 EOS token，导致相同文本的 Student 和 Teacher 平均值不同
+                # 解决：创建排除 EOS 的 mask
                 if compute_teacher:
-                    responses_for_mask = micro_batch["teacher_response"]
+                    response_ids = micro_batch["teacher_response"]
                 else:
-                    responses_for_mask = micro_batch["responses"]
-                last_token_mask = self._compute_last_token_mask(responses_for_mask, response_mask, compute_teacher)
-                values = values * last_token_mask.type_as(values)
+                    response_ids = micro_batch["responses"]
+                
+                # 获取 EOS token ID
+                if hasattr(self, '_tokenizer') and self._tokenizer is not None:
+                    eos_token_id = self._tokenizer.eos_token_id
+                else:
+                    eos_token_id = 151645  # Qwen 系列默认 EOS token ID
+                
+                # 找到 EOS token 的位置并排除
+                is_eos = (response_ids == eos_token_id)
+                response_mask_no_eos = response_mask & (~is_eos)
+                
+                # 使用排除 EOS 的 mask 计算平均值
+                values_sum = (values * response_mask_no_eos).sum(dim=-1)  # (batch,)
+                values_count = response_mask_no_eos.sum(dim=-1).clamp(min=1)  # (batch,)
+                sequence_value = values_sum / values_count  # (batch,)
+                
+                # 🔧 修复：确保数据类型一致（BFloat16）
+                sequence_value = sequence_value.to(values.dtype)
+                
+                # 为了保持接口一致（后续代码期望 shape 为 (batch, seq_len)）
+                # 将平均值放在最后一个有效位置，其他位置为 0
+                values_output = torch.zeros_like(values)
+                last_indices = (response_mask_no_eos.sum(dim=-1) - 1).long().clamp(min=0)
+                batch_indices = torch.arange(values.size(0), device=values.device)
+                values_output[batch_indices, last_indices] = sequence_value
+                
+                return values_output
             else:
                 output = self.critic_module(
                     input_ids=input_ids,
@@ -227,15 +258,40 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # Squeeze the last dimension if num_labels=1
                 values = values[:, -response_length:].squeeze(-1)  # (batch, response_length)
                 
-                # Apply last token mask for sequence-level scoring (跳过 EOS token)
+                # 🔧 修改：使用平均值而非 last token
                 response_mask = attention_mask[:, -response_length:]
+                
+                # 🔧 关键修复：显式排除 EOS token
                 if compute_teacher:
-                    responses_for_mask = micro_batch["teacher_response"]
+                    response_ids = micro_batch["teacher_response"]
                 else:
-                    responses_for_mask = micro_batch["responses"]
-                last_token_mask = self._compute_last_token_mask(responses_for_mask, response_mask, compute_teacher)
-                values = values * last_token_mask.type_as(values)
-            return values
+                    response_ids = micro_batch["responses"]
+                
+                # 获取 EOS token ID
+                if hasattr(self, '_tokenizer') and self._tokenizer is not None:
+                    eos_token_id = self._tokenizer.eos_token_id
+                else:
+                    eos_token_id = 151645  # Qwen 系列默认 EOS token ID
+                
+                # 找到 EOS token 的位置并排除
+                is_eos = (response_ids == eos_token_id)
+                response_mask_no_eos = response_mask & (~is_eos)
+                
+                # 使用排除 EOS 的 mask 计算平均值
+                values_sum = (values * response_mask_no_eos).sum(dim=-1)  # (batch,)
+                values_count = response_mask_no_eos.sum(dim=-1).clamp(min=1)  # (batch,)
+                sequence_value = values_sum / values_count  # (batch,)
+                
+                # 🔧 修复：确保数据类型一致（BFloat16）
+                sequence_value = sequence_value.to(values.dtype)
+                
+                # 为了保持接口一致，将平均值放在最后一个有效位置
+                values_output = torch.zeros_like(values)
+                last_indices = (response_mask_no_eos.sum(dim=-1) - 1).long().clamp(min=0)
+                batch_indices = torch.arange(values.size(0), device=values.device)
+                values_output[batch_indices, last_indices] = sequence_value
+                
+                return values_output
 
     def _forward_batch_teacher_forcing_grpo(self, batch, teacher_repeat):
         """
@@ -745,6 +801,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                         # 1. 增大 temperature 从 0.5 到 5.0，缓解梯度饱和
                         # 2. 关闭自适应 temperature，使用固定值
                         # 3. 启用 batch normalization，稳定训练
+                        # 4. 移除一致性损失（EOS Token 问题已通过显式排除修复）
                         d_loss, loss_info = core_algos.compute_discriminator_loss(
                             student_vpreds=student_vpreds,
                             teacher_vpreds=teacher_vpreds,
@@ -754,53 +811,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                             adaptive_temperature=False,  # 关闭自适应，使用固定值
                             use_batch_norm=True,  # 启用 batch normalization
                         )
-                        
-                        # 添加一致性损失：惩罚相同内容的分数差异
-                        # 这是解决顺序依赖问题的关键
-                        consistency_loss = torch.tensor(0.0, device=teacher_score.device)
-                        consistency_count = 0
-                        
-                        # 检查哪些样本的 student 和 teacher response 完全相同
-                        if hasattr(self, '_tokenizer'):
-                            try:
-                                for i in range(teacher_score.size(0)):
-                                    # 解码 student response
-                                    student_response_ids = model_inputs["responses"][i]
-                                    student_mask_i = response_mask[i]
-                                    student_valid_len = int(student_mask_i.sum().item())
-                                    student_text = self._tokenizer.decode(
-                                        student_response_ids[:student_valid_len].cpu(),
-                                        skip_special_tokens=True
-                                    ).strip()
-                                    
-                                    # 解码 teacher response
-                                    teacher_response_ids = model_inputs["teacher_response"][i]
-                                    teacher_mask_i = teacher_response_mask[i]
-                                    teacher_valid_len = int(teacher_mask_i.sum().item())
-                                    teacher_text = self._tokenizer.decode(
-                                        teacher_response_ids[:teacher_valid_len].cpu(),
-                                        skip_special_tokens=True
-                                    ).strip()
-                                    
-                                    # 如果文本完全相同，添加一致性约束
-                                    if student_text == teacher_text and len(student_text) > 0:
-                                        score_diff = (teacher_score[i] - student_score[i]) ** 2
-                                        consistency_loss += score_diff
-                                        consistency_count += 1
-                            except Exception as e:
-                                # 如果解码失败，跳过一致性损失
-                                logger.warning(f"Failed to compute consistency loss: {e}")
-                        
-                        # 归一化并添加到总损失
-                        if consistency_count > 0:
-                            consistency_loss = consistency_loss / consistency_count
-                            # 一致性损失权重：1.0（与 ranking loss 同等重要）
-                            d_loss = d_loss + 1.0 * consistency_loss
-                            loss_info["consistency_loss"] = consistency_loss.detach().item()
-                            loss_info["consistency_count"] = consistency_count
-                        else:
-                            loss_info["consistency_loss"] = 0.0
-                            loss_info["consistency_count"] = 0
                         
                         if self.config.use_dynamic_bsz:
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size

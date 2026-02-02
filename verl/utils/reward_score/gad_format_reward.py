@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, Tuple
 
 
 def extract_json_from_text(text: str) -> Optional[str]:
-    """从文本中提取第一个完整的 JSON 对象"""
+    """从文本中提取第一个完整的 JSON 对象（支持单双引号）"""
     start = text.find('{')
     if start == -1:
         return None
@@ -16,6 +16,7 @@ def extract_json_from_text(text: str) -> Optional[str]:
     depth = 0
     in_string = False
     escape_next = False
+    string_char = None  # 记录当前字符串使用的引号类型
     
     for i, char in enumerate(text[start:], start):
         if escape_next:
@@ -24,8 +25,14 @@ def extract_json_from_text(text: str) -> Optional[str]:
         if char == '\\' and in_string:
             escape_next = True
             continue
-        if char == '"' and not escape_next:
-            in_string = not in_string
+        # 支持单引号和双引号
+        if char in ('"', "'") and not escape_next:
+            if not in_string:
+                in_string = True
+                string_char = char
+            elif char == string_char:
+                in_string = False
+                string_char = None
             continue
         if in_string:
             continue
@@ -35,6 +42,60 @@ def extract_json_from_text(text: str) -> Optional[str]:
             depth -= 1
             if depth == 0:
                 return text[start:i + 1]
+    return None
+
+
+def detect_quote_style(text: str) -> Optional[str]:
+    """
+    检测JSON中使用的引号风格（只统计JSON结构的引号，不统计字符串值内的引号）
+    返回: "single" (单引号), "double" (双引号), "mixed" (混合), None (无法判断)
+    """
+    json_str = extract_json_from_text(text)
+    if not json_str:
+        return None
+    
+    # 统计引号数量（只统计JSON结构的引号，排除字符串值内的引号）
+    single_count = 0
+    double_count = 0
+    escape_next = False
+    in_string = False
+    string_char = None
+    
+    for char in json_str:
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\':
+            escape_next = True
+            continue
+        
+        # 只统计字符串边界的引号
+        if char in ('"', "'") and not escape_next:
+            if not in_string:
+                # 进入字符串，统计这个引号
+                in_string = True
+                string_char = char
+                if char == "'":
+                    single_count += 1
+                else:
+                    double_count += 1
+            elif char == string_char:
+                # 退出字符串，统计这个引号
+                in_string = False
+                string_char = None
+                if char == "'":
+                    single_count += 1
+                else:
+                    double_count += 1
+            # 字符串内部的另一种引号不统计
+    
+    # 判断主要风格
+    if single_count > 0 and double_count == 0:
+        return "single"
+    elif double_count > 0 and single_count == 0:
+        return "double"
+    elif single_count > 0 and double_count > 0:
+        return "mixed"
     return None
 
 
@@ -67,25 +128,74 @@ def parse_json_safe(text: str) -> Tuple[Optional[dict], str]:
     # 4. 尝试解析 JSON
     json_str = extract_json_from_text(text)
     if json_str:
+        # 先尝试标准 JSON 解析（双引号）
         try:
             parsed = json.loads(json_str)
             if isinstance(parsed, dict):
                 return parsed, "ok"
             return None, "invalid"
         except json.JSONDecodeError:
+            # 如果失败，尝试智能转换单引号为双引号
+            try:
+                json_str_converted = _convert_single_to_double_quotes(json_str)
+                parsed = json.loads(json_str_converted)
+                if isinstance(parsed, dict):
+                    return parsed, "ok"  # 结构正确，但引号可能不对
+            except (json.JSONDecodeError, Exception):
+                pass
             return None, "invalid"
     
     return None, "invalid"
 
 
+def _convert_single_to_double_quotes(json_str: str) -> str:
+    """
+    智能转换单引号为双引号（避免转换字符串值中的引号）
+    这是一个简化版本，适用于大多数情况
+    """
+    result = []
+    in_string = False
+    escape_next = False
+    string_char = None
+    
+    for char in json_str:
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            continue
+        
+        if char == '\\':
+            result.append(char)
+            escape_next = True
+            continue
+        
+        if char in ('"', "'"):
+            if not in_string:
+                in_string = True
+                string_char = char
+                result.append('"')  # 统一转换为双引号
+            elif char == string_char:
+                in_string = False
+                string_char = None
+                result.append('"')  # 统一转换为双引号
+            else:
+                # 字符串内部的另一种引号，保持原样
+                result.append(char)
+        else:
+            result.append(char)
+    
+    return ''.join(result)
+
+
 def check_json_consistency(solution: str, ground_truth: str) -> Tuple[Optional[Dict], Optional[dict]]:
     """
-    检测 JSON 格式一致性（通用版）
+    检测 JSON 格式一致性（通用版 + 引号风格检测）
     
     核心逻辑：
     1. 如果 ground_truth 是有效 JSON，则 solution 也必须是有效 JSON
     2. 如果 ground_truth 包含特定字段，检查 solution 是否也包含
-    3. 如果 ground_truth 是纯文本（非 JSON），则不检查 JSON 格式
+    3. 检查引号风格是否与 ground_truth 一致
+    4. 如果 ground_truth 是纯文本（非 JSON），则不检查 JSON 格式
     
     返回：(惩罚信息, 解析后的JSON)
     """
@@ -109,14 +219,44 @@ def check_json_consistency(solution: str, ground_truth: str) -> Tuple[Optional[D
         elif sol_status == "prefix":
             return {"type": "json_prefix", "penalty": 0.3}, None
         elif sol_status == "ok":
-            # JSON 解析成功，检查字段一致性
+            # JSON 解析成功，先检查引号风格一致性
+            gt_quote_style = detect_quote_style(ground_truth)
+            sol_quote_style = detect_quote_style(solution)
+            
+            if gt_quote_style and sol_quote_style:
+                # 优先级：混合引号 > 风格不匹配
+                if sol_quote_style == "mixed":
+                    # 如果 GT 也是混合的，惩罚较轻；否则惩罚较重
+                    if gt_quote_style == "mixed":
+                        return {
+                            "type": "quote_style_mixed",
+                            "penalty": 0.1  # GT 也是混合的，惩罚较轻
+                        }, sol_json
+                    else:
+                        return {
+                            "type": "quote_style_mixed",
+                            "gt_style": gt_quote_style,
+                            "sol_style": "mixed",
+                            "penalty": 0.2  # GT 不是混合的，惩罚较重
+                        }, sol_json
+                # 如果 GT 和 solution 的引号风格不一致（且都不是混合）
+                elif gt_quote_style != sol_quote_style:
+                    return {
+                        "type": "quote_style_mismatch",
+                        "gt_style": gt_quote_style,
+                        "sol_style": sol_quote_style,
+                        "penalty": 0.15
+                    }, sol_json
+            
+            # 检查字段一致性
             if gt_json and sol_json:
                 gt_keys = set(gt_json.keys())
                 sol_keys = set(sol_json.keys())
                 missing_keys = gt_keys - sol_keys
                 if missing_keys:
                     return {"type": "json_keys_missing", "keys": list(missing_keys), "penalty": 0.2}, sol_json
-            return None, sol_json  # JSON 正确
+            
+            return None, sol_json  # JSON 正确且引号风格一致
     
     # ground_truth 不是 JSON，不检查 JSON 格式
     return None, sol_json
