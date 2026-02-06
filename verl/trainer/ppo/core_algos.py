@@ -1399,12 +1399,12 @@ def compute_discriminator_loss(
     margin: float = 0.5,  # 保留参数以保持接口兼容，但不再使用
     temperature: float = 0.5,  # 新增：可配置的 temperature
     adaptive_temperature: bool = False,  # 新增：是否使用自适应 temperature
-    use_batch_norm: bool = True,  # 新增：是否使用 batch normalization
 ) -> tuple:
     """
     Compute discriminator loss for GAD training.
     
     改进版：移除了 hinge_loss_lower，允许 student 无限逼近 teacher。
+    简化版：移除了混合分数和 Batch Normalization，直接使用原始分数。
     
     设计目标：
     - 判别器学习区分 teacher 和 student 的能力
@@ -1414,7 +1414,6 @@ def compute_discriminator_loss(
     损失组件：
     1. Ranking Loss: logsigmoid 软约束，提供持续的梯度信号
     2. Score Regularization: 防止分数漂移到极端值
-    3. Over-confidence Penalty: 软约束，防止判别器过度自信导致梯度消失
     
     收敛状态：
     - score_diff → 0: student 和 teacher 质量相当
@@ -1451,41 +1450,19 @@ def compute_discriminator_loss(
     teacher_score_norm = teacher_score_raw / teacher_mask_sum
     student_score_norm = student_score_raw / student_mask_sum
     
-    # 混合策略：70% 原始分数 + 30% 归一化分数
+    # 简化：直接使用原始分数
     # 理由：
-    # 1. 保留大部分长度信息（70%），奖励详细的高质量回答
-    # 2. 仍然有一定的长度公平性（30%），防止极端长度欺骗
-    # 3. max_response_length=256 已经限制了长度范围
-    # 4. format_reward 已经惩罚重复和冗长
-    raw_weight = 0.7
-    norm_weight = 0.3
-    teacher_score = raw_weight * teacher_score_raw + norm_weight * teacher_score_norm
-    student_score = raw_weight * student_score_raw + norm_weight * student_score_norm
+    # 1. EOS Token 问题已通过显式排除修复（dp_critic.py）
+    # 2. 长度偏见已显著改善（Teacher-Student 长度差异 < 10%）
+    # 3. 混合分数和 Batch Norm 增加复杂度但效果不明确
+    # 4. 当前训练已经稳定（d_acc=93%, score_diff=1.76）
+    # 5. 长度已有其他控制：max_response_length=256, format_reward 惩罚重复
+    teacher_score = teacher_score_raw
+    student_score = student_score_raw
     
-    # 新增：Batch Normalization (可选)
-    # 目标：自动适应不同 batch 的分数分布，稳定训练
-    batch_norm_info = {}
-    if use_batch_norm:
-        # 合并所有分数进行归一化
-        all_scores = torch.cat([teacher_score, student_score])
-        mean = all_scores.mean()
-        std = all_scores.std() + 1e-8
-        
-        # 归一化到标准正态分布
-        teacher_score_normalized = (teacher_score - mean) / std
-        student_score_normalized = (student_score - mean) / std
-        
-        # 使用归一化后的分数计算 diff
-        diff = teacher_score_normalized - student_score_normalized
-        
-        # 记录归一化信息（用于监控）
-        batch_norm_info = {
-            "batch_mean": mean.detach().item(),
-            "batch_std": std.detach().item(),
-        }
-    else:
-        # Relativistic difference: 判别器希望 teacher > student
-        diff = teacher_score - student_score
+    # 计算分数差异
+    # Relativistic difference: 判别器希望 teacher > student
+    diff = teacher_score - student_score
     
     # ==============================
     # 2. 损失函数组件 (Loss Components)
@@ -1504,79 +1481,85 @@ def compute_discriminator_loss(
     # 根据当前 score_diff 的大小动态调整
     # - diff 小时用小 temperature（强梯度）→ 快速建立区分能力
     # - diff 大时用大 temperature（弱梯度）→ 精细化区分
+    # 
+    # 优化 2026-02-05：调整映射范围以适配 Score Range Regularization
+    # Score Range Regularization 会使 diff 增大到 3.0-4.0，需要更大的 temperature 范围
     if adaptive_temperature:
         # 自适应策略：diff 越小，temperature 越小
         current_diff_abs = diff.abs().mean().item()
-        # 映射函数：
-        # - diff=0.05 → T=0.335 (强梯度，快速学习)
-        # - diff=0.5  → T=0.65  (中等梯度)
-        # - diff=1.0  → T=1.0   (标准梯度)
-        # - diff=2.0  → T=1.7   (弱梯度，精细区分)
-        adaptive_temp = torch.clamp(
-            torch.tensor(0.3 + current_diff_abs * 0.7, device=diff.device),
-            min=0.3,
-            max=2.0
-        )
-        temperature = adaptive_temp.item()
+        # 新映射函数（适配更大的 diff）：
+        # - diff=1.0 → T=0.5  (强梯度，快速学习)
+        # - diff=2.0 → T=1.0  (中等梯度)
+        # - diff=3.0 → T=1.5  (标准梯度)
+        # - diff=4.0 → T=2.0  (弱梯度，精细区分)
+        # - diff=5.0 → T=2.5  (很弱梯度)
+        # 优化：直接计算标量，避免创建张量
+        temperature = max(0.5, min(3.0, 0.5 * current_diff_abs))
     
     scaled_diff = diff / temperature
     scaled_diff = torch.clamp(scaled_diff, min=-10, max=10)
     ranking_loss = -torch.nn.functional.logsigmoid(scaled_diff).mean()
     
-    # Component 2: Score Drift Regularization (优化：更强的正则化)
-    # 目标：防止判别器输出值整体飘向正负无穷
-    # 优化 2026-01-28：
-    # - 降低 threshold 从 5.0 到 3.0，约束更多极端值
-    # - 增大权重从 0.001 到 0.01，增强约束力度 10 倍
-    score_threshold = 3.0  # 从 5.0 降低到 3.0
-    teacher_extreme = torch.nn.functional.relu(teacher_score_raw.abs() - score_threshold)
-    student_extreme = torch.nn.functional.relu(student_score_raw.abs() - score_threshold)
-    score_reg = 0.01 * (teacher_extreme.pow(2).mean() + student_extreme.pow(2).mean())  # 从 0.001 增加到 0.01
+    # Component 2: Score Range Regularization (新增：引导分数到目标范围)
+    # 目标：引导 Critic 给出有明确语义的分数范围
+    # 
+    # 设计理念：
+    # - Teacher 应该得到正分数（高质量答案）：目标范围 [5, 10]
+    # - Student 允许更大范围（质量不确定）：目标范围 [2, 10]  # 从 [0, 10] 提高到 [2, 10]
+    # - 使用软约束（正则化），不是硬截断
+    # - 通过梯度逐步引导分数到目标范围
+    # 
+    # 分数语义：
+    # Teacher: 5=及格, 6=良好, 7-8=优秀, 9-10=完美
+    # Student: 2=较差, 4=中等, 6=良好, 8-10=优秀
+    
+    # Teacher 约束：鼓励在 [5, 10] 范围
+    TEACHER_SCORE_LOW = 5.0
+    TEACHER_SCORE_HIGH = 10.0
+    teacher_low_penalty = torch.nn.functional.relu(TEACHER_SCORE_LOW - teacher_score_raw)
+    teacher_high_penalty = torch.nn.functional.relu(teacher_score_raw - TEACHER_SCORE_HIGH)
+    
+    # Student 约束：鼓励在 [2, 10] 范围（从 [0, 10] 提高）
+    # 理由：避免长期负分数，确保 GAD 阶段有正向 reward 信号
+    STUDENT_SCORE_LOW = 2.0  # 从 0.0 提高到 2.0
+    STUDENT_SCORE_HIGH = 10.0
+    student_low_penalty = torch.nn.functional.relu(STUDENT_SCORE_LOW - student_score_raw)
+    student_high_penalty = torch.nn.functional.relu(student_score_raw - STUDENT_SCORE_HIGH)
+    
+    # 总正则化损失
+    # 权重 0.15：从 0.1 增大到 0.15，加速 Student 分数上升
+    SCORE_REG_WEIGHT = 0.15  # 从 0.1 增大到 0.15
+    score_reg = SCORE_REG_WEIGHT * (
+        teacher_low_penalty.pow(2).mean() +
+        teacher_high_penalty.pow(2).mean() +
+        student_low_penalty.pow(2).mean() +
+        student_high_penalty.pow(2).mean()
+    )
     
     # ==============================
     # 3. 总损失聚合
     # ==============================
-    # 注意：长度惩罚不应加在判别器 loss 上，原因：
-    # 1. 会与 max_response_length 截断冲突
-    # 2. 可能阻止 student 生成更详细的好回答
-    # 3. 长度惩罚应该加在 Actor 的 reward 上，而非 Critic 的 loss 上
-    # 
-    # 现有的归一化得分（mean 而非 sum）已经提供了基础的长度无关性
-    # 
-    # 优化：移除 diff_penalty
-    # 理由：
-    # 1. 与训练目标冲突（我们希望 critic 学会强区分能力）
-    # 2. 当前 score_diff 很小（0.076），该惩罚不会触发
-    # 3. 简化 loss，让 ranking_loss 和 score_reg 各司其职
-    # 4. 如果 teacher 确实远优于 student，应该允许大的分数差
-    d_loss = 3.0 * ranking_loss + score_reg
+    # 优化 2026-02-05：减小 ranking_loss 权重，让 score_reg 有更大影响
+    # 理由：避免 Warmup 阶段分差过大，影响后续 GAD 训练
+    # 从 3.0 减小到 2.5
+    d_loss = 2.5 * ranking_loss + score_reg
     
     # ==============================
-    # 4. 监控指标
+    # 4. 监控指标（简化版）
     # ==============================
     loss_info = {
+        # 核心损失指标
         "ranking_loss": ranking_loss.detach().item(),
-        # 核心观察指标：score_diff
-        # 训练初期应该 > 0，随训练趋向 0 说明 student 正在成功模仿 teacher
-        # 如果 < 0，说明 student 在判别器眼里已超过 teacher
-        "score_diff": diff.mean().detach().item(),
         "score_reg": score_reg.detach().item(),
-        # 观察绝对分值，确保没有发生数值漂移
+        
+        # 核心分数指标
+        "score_diff": diff.mean().detach().item(),
         "teacher_score_mean": teacher_score.mean().detach().item(),
         "student_score_mean": student_score.mean().detach().item(),
-        # 新增：记录实际使用的 temperature
+        
+        # Temperature
         "temperature": temperature if isinstance(temperature, float) else temperature,
-        # 新增：长度相关指标
-        "teacher_length_mean": teacher_mask_sum.mean().detach().item(),
-        "student_length_mean": student_mask_sum.mean().detach().item(),
-        "length_ratio": (teacher_mask_sum / student_mask_sum).mean().detach().item(),
-        # 新增：原始分数和归一化分数的差异
-        "score_raw_diff": (teacher_score_raw - student_score_raw).mean().detach().item(),
-        "score_norm_diff": (teacher_score_norm - student_score_norm).mean().detach().item(),
     }
-    
-    # 添加 batch normalization 信息
-    loss_info.update(batch_norm_info)
     
     return d_loss, loss_info
 

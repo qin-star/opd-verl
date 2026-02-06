@@ -793,23 +793,31 @@ class DataParallelPPOCritic(BasePPOCritic):
                             )
                         
                         # Compute discriminator accuracy (per-sample comparison)
-                        # For GAD: teacher should score higher than student
-                        d_acc = (teacher_score > student_score).float().mean()
+                        # 使用软标签方案：将分数差异映射到 [0, 1] 区间
+                        # 优势：
+                        # 1. score_diff = 0 → d_acc = 0.5（中性，相同质量）
+                        # 2. score_diff > 0 → d_acc > 0.5（teacher 更好）
+                        # 3. score_diff < 0 → d_acc < 0.5（student 更好，异常）
+                        # 4. 连续可微，避免硬阈值导致的不连续性
+                        score_diff = teacher_score - student_score
+                        d_acc = torch.sigmoid(score_diff).mean()  # 软标签
+                        
+                        # 同时保留硬标签用于对比（仅用于监控）
+                        d_acc_hard = (teacher_score > student_score).float().mean()
                         
                         # Compute discriminator loss (now returns tuple with loss_info)
-                        # 优化 2026-01-28：
+                        # 优化 2026-01-29：
                         # 1. 增大 temperature 从 0.5 到 5.0，缓解梯度饱和
                         # 2. 关闭自适应 temperature，使用固定值
-                        # 3. 启用 batch normalization，稳定训练
-                        # 4. 移除一致性损失（EOS Token 问题已通过显式排除修复）
+                        # 3. 移除一致性损失（EOS Token 问题已通过显式排除修复）
+                        # 4. 移除混合分数和 Batch Normalization（简化代码，直接使用原始分数）
                         d_loss, loss_info = core_algos.compute_discriminator_loss(
                             student_vpreds=student_vpreds,
                             teacher_vpreds=teacher_vpreds,
                             response_mask=response_mask,
                             teacher_response_mask=teacher_response_mask,
-                            temperature=5.0,  # 从 0.5 增大到 5.0
-                            adaptive_temperature=False,  # 关闭自适应，使用固定值
-                            use_batch_norm=True,  # 启用 batch normalization
+                            temperature=1,  # 从 0.5 增大到 5.0
+                            adaptive_temperature=True,  # 关闭自适应，使用固定值
                         )
                         
                         if self.config.use_dynamic_bsz:
@@ -825,38 +833,21 @@ class DataParallelPPOCritic(BasePPOCritic):
                         student_lengths = response_mask.sum(dim=-1).float()
                         teacher_lengths = teacher_response_mask.sum(dim=-1).float()
                         
-                        # 优化后的指标（方案 A - 精简版）：从 30 个减少到 15 个核心指标
-                        # 删除冗余：student_value_mean, teacher_value_mean, raw_score_diff (重复)
-                        # 删除低价值：score_diff_abs, p25/p75 分位数, score_overlap, min/max
+                        # 优化后的指标（精简版）：只保留核心指标
+                        # 从 core_algos 获取的指标已经简化，这里只添加必要的额外指标
                         micro_batch_metrics.update(
                             {
-                                # 核心指标（6 个）
+                                # 核心损失和准确率（3 个）
                                 "critic/d_loss": d_loss.detach().item(),
-                                "critic/d_acc": d_acc.detach().item(),
+                                "critic/d_acc": d_acc.detach().item(),  # 软标签准确率
+                                
+                                # 从 core_algos 获取的核心指标（6 个）
                                 "critic/ranking_loss": loss_info["ranking_loss"],
-                                "critic/score_reg": loss_info.get("score_reg", 0.0),
+                                "critic/score_reg": loss_info["score_reg"],
                                 "critic/score_diff": loss_info["score_diff"],
-                                "critic/temperature": loss_info.get("temperature", 1.0),
-                                
-                                # 分数统计（4 个）- 保留均值和标准差，删除 min/max/p25/p75
-                                "critic/teacher_score_mean": loss_info.get("teacher_score_mean", 0.0),
-                                "critic/student_score_mean": loss_info.get("student_score_mean", 0.0),
-                                "critic/teacher_score_std": teacher_score.std().detach().item(),
-                                "critic/student_score_std": student_score.std().detach().item(),
-                                
-                                # 长度相关（3 个）
-                                "critic/teacher_length": loss_info.get("teacher_length_mean", teacher_lengths.mean().detach().item()),
-                                "critic/student_length": loss_info.get("student_length_mean", student_lengths.mean().detach().item()),
-                                "critic/length_ratio": loss_info.get("length_ratio", 1.0),
-                                
-                                # 归一化对比（2 个）- 用于监控混合策略效果
-                                "critic/score_raw_diff": loss_info.get("score_raw_diff", 0.0),
-                                "critic/score_norm_diff": loss_info.get("score_norm_diff", 0.0),
-                                
-                                # 高级指标（2 个）- 用于诊断训练质量
-                                "critic/score_separation": ((teacher_score.mean() - student_score.mean()) / 
-                                                           (teacher_score.std() + student_score.std() + 1e-8)).detach().item(),
-                                "critic/hard_samples_ratio": (torch.abs(teacher_score - student_score) < 0.1).float().mean().detach().item(),
+                                "critic/teacher_score_mean": loss_info["teacher_score_mean"],
+                                "critic/student_score_mean": loss_info["student_score_mean"],
+                                "critic/temperature": loss_info["temperature"],
                             }
                         )
                     else:
@@ -894,11 +885,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm, grad_norm_before_clip = self._optimizer_step()
-                # 梯度指标（2 个）- 保留最关键的梯度监控信息
-                # 删除：grad_clip_ratio, effective_gradient（可以从其他指标推导）
+                # 梯度指标（1 个）- 只保留最关键的梯度范数
                 mini_batch_metrics = {
                     "critic/grad_norm": grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm,
-                    "critic/grad_norm_before_clip": grad_norm_before_clip,
                 }
                 append_to_dict(metrics, mini_batch_metrics)
         self.critic_optimizer.zero_grad()
