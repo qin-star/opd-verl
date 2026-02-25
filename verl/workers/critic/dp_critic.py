@@ -201,14 +201,21 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # For sequence-level reward model: extract current token values
                 values = values[:, -response_length:]
                 
-                # 🔧 修改：使用平均值而非 last token
-                # 原因：last token 机制导致 Critic 无法理解语义，只是比较随机的 token value
-                # 平均值机制强制模型通过梯度反向传播学习整个序列的语义
+                # ============================================================
+                # [CONFIG] 方案选择：平均值 vs Last Token
+                # ============================================================
+                # 当前使用：平均值方案（推荐）
+                # 备选方案：Last Token 方案（见下方注释代码）
+                # 
+                # 选择平均值的原因：
+                # 1. 避免 Reward Hacking（格式敏感问题）
+                # 2. 梯度反向传播到所有 token，强制学习语义
+                # 3. 减小方差（σ²/N），分数更稳定
+                # ============================================================
+                
                 response_mask = attention_mask[:, -response_length:]
                 
-                # 🔧 关键修复：显式排除 EOS token
-                # 问题：response_mask 包含 EOS token，导致相同文本的 Student 和 Teacher 平均值不同
-                # 解决：创建排除 EOS 的 mask
+                # 获取 response IDs
                 if compute_teacher:
                     response_ids = micro_batch["teacher_response"]
                 else:
@@ -229,7 +236,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values_count = response_mask_no_eos.sum(dim=-1).clamp(min=1)  # (batch,)
                 sequence_value = values_sum / values_count  # (batch,)
                 
-                # 🔧 修复：确保数据类型一致（BFloat16）
+                # 确保数据类型一致（BFloat16）
                 sequence_value = sequence_value.to(values.dtype)
                 
                 # 为了保持接口一致（后续代码期望 shape 为 (batch, seq_len)）
@@ -240,6 +247,35 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values_output[batch_indices, last_indices] = sequence_value
                 
                 return values_output
+                
+                # ============================================================
+                # [NOTE] Last Token 方案（已注释，不推荐）
+                # ============================================================
+                # 问题：
+                # 1. 容易导致 Reward Hacking（对格式敏感，如换行符）
+                # 2. 只有最后一个 token 有梯度，前面 token 参数不更新
+                # 3. 依赖单个 token 的 value，方差大（σ²）
+                # 
+                # 优势：
+                # 1. 理论上表达能力更强（非线性聚合）
+                # 2. 原始 GAD 论文的设计
+                # ============================================================
+                # response_mask = attention_mask[:, -response_length:]
+                # if compute_teacher:
+                #     responses_for_mask = micro_batch["teacher_response"]
+                # else:
+                #     responses_for_mask = micro_batch["responses"]
+                #
+                # # 计算 last token mask（跳过 EOS）
+                # last_token_mask = self._compute_last_token_mask(
+                #     responses_for_mask, response_mask, compute_teacher
+                # )
+                #
+                # # 只保留最后一个 token 的 value
+                # values = values * last_token_mask.type_as(values)
+                # 
+                # return values
+                # ============================================================
             else:
                 output = self.critic_module(
                     input_ids=input_ids,
@@ -258,10 +294,21 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # Squeeze the last dimension if num_labels=1
                 values = values[:, -response_length:].squeeze(-1)  # (batch, response_length)
                 
-                # 🔧 修改：使用平均值而非 last token
+                # ============================================================
+                # [CONFIG] 方案选择：平均值 vs Last Token
+                # ============================================================
+                # 当前使用：平均值方案（推荐）
+                # 备选方案：Last Token 方案（见下方注释代码）
+                # 
+                # 选择平均值的原因：
+                # 1. 避免 Reward Hacking（格式敏感问题）
+                # 2. 梯度反向传播到所有 token，强制学习语义
+                # 3. 减小方差（σ²/N），分数更稳定
+                # ============================================================
+                
                 response_mask = attention_mask[:, -response_length:]
                 
-                # 🔧 关键修复：显式排除 EOS token
+                # 获取 response IDs
                 if compute_teacher:
                     response_ids = micro_batch["teacher_response"]
                 else:
@@ -282,7 +329,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values_count = response_mask_no_eos.sum(dim=-1).clamp(min=1)  # (batch,)
                 sequence_value = values_sum / values_count  # (batch,)
                 
-                # 🔧 修复：确保数据类型一致（BFloat16）
+                # 确保数据类型一致（BFloat16）
                 sequence_value = sequence_value.to(values.dtype)
                 
                 # 为了保持接口一致，将平均值放在最后一个有效位置
@@ -292,6 +339,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values_output[batch_indices, last_indices] = sequence_value
                 
                 return values_output
+                
+                # Last Token 方案（已注释）
+                # response_mask = attention_mask[:, -response_length:]
+                # if compute_teacher:
+                #     responses_for_mask = micro_batch["teacher_response"]
+                # else:
+                #     responses_for_mask = micro_batch["responses"]
+                # last_token_mask = self._compute_last_token_mask(
+                #     responses_for_mask, response_mask, compute_teacher
+                # )
+                # values = values * last_token_mask.type_as(values)
+                # return values
 
     def _forward_batch_teacher_forcing_grpo(self, batch, teacher_repeat):
         """
@@ -433,14 +492,14 @@ class DataParallelPPOCritic(BasePPOCritic):
         # 构建完整的输出字符串
         output_lines = []
         output_lines.append("\n" + "="*100)
-        output_lines.append(f"📊 Critic 打分详情 - Step {step}")
+        output_lines.append(f"[STATS] Critic 打分详情 - Step {step}")
         output_lines.append("="*100)
         
         try:
             batch_size = teacher_score.size(0)
             
             # 添加批次信息诊断
-            output_lines.append(f"\n🔍 批次信息:")
+            output_lines.append(f"\n[INFO] 批次信息:")
             output_lines.append(f"  总样本数: {batch_size}")
             output_lines.append(f"  Input IDs shape: {model_inputs['input_ids'].shape}")
             output_lines.append(f"  Responses shape: {model_inputs['responses'].shape}")
@@ -452,7 +511,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             
             for sample_idx in range(num_samples_to_show):
                 output_lines.append("\n" + "="*100)
-                output_lines.append(f"� 样本 #{sample_idx + 1}")
+                output_lines.append(f"[SAMPLE] #{sample_idx + 1}")
                 output_lines.append("="*100)
                 
                 # 解码 prompt（从 input_ids 中提取，去掉 response 部分）
@@ -468,12 +527,12 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # 解码 prompt（完整显示，不截断）
                 prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
                 
-                output_lines.append(f"\n📝 Prompt:")
+                output_lines.append(f"\n[NOTE] Prompt:")
                 output_lines.append(f"  {prompt_text}")
                 output_lines.append("")
                 
                 # 显示对应的 student response
-                output_lines.append(f"🎓 Student Response:")
+                output_lines.append(f"[STUDENT] Student Response:")
                 output_lines.append("-" * 100)
                 
                 response_ids = model_inputs["responses"][sample_idx].cpu()
@@ -492,7 +551,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                 output_lines.append("")
                 
                 # 显示对应的 teacher response
-                output_lines.append(f"👨‍🏫 Teacher Response:")
+                output_lines.append(f"[TEACHER] Teacher Response:")
                 output_lines.append("-" * 100)
                 
                 teacher_response_ids = model_inputs["teacher_response"][sample_idx].cpu()
@@ -510,9 +569,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                 
                 # 显示分数对比
                 score_diff = teacher_score_val - score
-                output_lines.append(f"📊 分数对比:")
+                output_lines.append(f"[STATS] 分数对比:")
                 output_lines.append(f"  Teacher - Student = {score_diff:7.4f}")
-                output_lines.append(f"  Teacher > Student: {'✅ 正确' if teacher_score_val > score else '❌ 错误' if teacher_score_val < score else '⚖️  相等'}")
+                output_lines.append(f"  Teacher > Student: {'[OK] 正确' if teacher_score_val > score else '[ERROR] 错误' if teacher_score_val < score else '[EQUAL]  相等'}")
                 
                 # 检查内容相似度（简单的文本匹配）
                 if teacher_text.strip() == response_text.strip():
@@ -522,26 +581,26 @@ class DataParallelPPOCritic(BasePPOCritic):
                     
                     # 只有当分数差异显著时才警告
                     if abs(score_diff) > 0.5:
-                        output_lines.append(f"  ⚠️  警告: Teacher 和 Student 回答完全相同，但分数差异为 {abs(score_diff):.4f}!")
+                        output_lines.append(f"  [WARNING]  警告: Teacher 和 Student 回答完全相同，但分数差异为 {abs(score_diff):.4f}!")
                         
                         if student_token_len != teacher_token_len:
-                            output_lines.append(f"  🚨 关键发现: 相同文本但 token 长度不同!")
+                            output_lines.append(f"  [ALERT] 关键发现: 相同文本但 token 长度不同!")
                             output_lines.append(f"     Student tokens: {student_token_len}")
                             output_lines.append(f"     Teacher tokens: {teacher_token_len}")
                             output_lines.append(f"     这可能是分数差异的根本原因！")
                     elif student_token_len != teacher_token_len:
                         # 分数相同但长度不同，说明修复生效
-                        output_lines.append(f"  ✅ 相同文本，分数一致 (分差: {abs(score_diff):.4f})")
-                        output_lines.append(f"  📝 注: Student 包含 EOS token ({student_token_len} tokens)，Teacher 不包含 ({teacher_token_len} tokens)")
+                        output_lines.append(f"  [OK] 相同文本，分数一致 (分差: {abs(score_diff):.4f})")
+                        output_lines.append(f"  [NOTE] 注: Student 包含 EOS token ({student_token_len} tokens)，Teacher 不包含 ({teacher_token_len} tokens)")
                         output_lines.append(f"     EOS token 已被正确跳过，提取了相同位置的 token")
                     else:
                         # 完美情况：长度和分数都相同
-                        output_lines.append(f"  ✅ 完美: 相同文本，相同长度，相同分数")
+                        output_lines.append(f"  [OK] 完美: 相同文本，相同长度，相同分数")
             
             output_lines.append("\n" + "="*100)
             
             # 全局统计信息
-            output_lines.append(f"\n� 全局统计信息 (共 {batch_size} 个样本):")
+            output_lines.append(f"\n[GLOBAL STATS] (共 {batch_size} 个样本):")
             output_lines.append("-" * 100)
             output_lines.append(f"  Teacher 平均分: {teacher_score.mean().item():7.4f}")
             output_lines.append(f"  Student 平均分: {student_score.mean().item():7.4f}")
@@ -575,20 +634,20 @@ class DataParallelPPOCritic(BasePPOCritic):
             
             if same_answer_count > 0:
                 avg_diff = sum(same_answer_score_diffs) / len(same_answer_score_diffs)
-                output_lines.append(f"\n⚠️  顺序依赖诊断:")
+                output_lines.append(f"\n[WARNING]  顺序依赖诊断:")
                 output_lines.append(f"  相同答案数量: {same_answer_count}/{batch_size}")
                 output_lines.append(f"  相同答案的平均分差: {avg_diff:.4f}")
                 
                 # 更新警告阈值：修复后应该 < 0.5
                 if avg_diff > 1.0:
-                    output_lines.append(f"  🚨 警告: 相同答案分差过大 (>{avg_diff:.2f})，可能存在严重的顺序依赖问题!")
+                    output_lines.append(f"  [ALERT] 警告: 相同答案分差过大 (>{avg_diff:.2f})，可能存在严重的顺序依赖问题!")
                 elif avg_diff > 0.5:
-                    output_lines.append(f"  ⚠️  注意: 相同答案分差略高 ({avg_diff:.2f})，建议继续观察")
+                    output_lines.append(f"  [WARNING]  注意: 相同答案分差略高 ({avg_diff:.2f})，建议继续观察")
                 else:
-                    output_lines.append(f"  ✅ 良好: 相同答案分差很小 ({avg_diff:.2f})，EOS token 修复生效!")
+                    output_lines.append(f"  [OK] 良好: 相同答案分差很小 ({avg_diff:.2f})，EOS token 修复生效!")
             
         except Exception as e:
-            output_lines.append(f"  ⚠️  记录详情时出错: {e}")
+            output_lines.append(f"  [WARNING]  记录详情时出错: {e}")
             import traceback
             output_lines.append(f"  错误堆栈: {traceback.format_exc()}")
             logger.warning(f"Error in _log_scoring_details: {e}")

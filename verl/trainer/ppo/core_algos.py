@@ -1500,35 +1500,38 @@ def compute_discriminator_loss(
     scaled_diff = torch.clamp(scaled_diff, min=-10, max=10)
     ranking_loss = -torch.nn.functional.logsigmoid(scaled_diff).mean()
     
-    # Component 2: Score Range Regularization (新增：引导分数到目标范围)
-    # 目标：引导 Critic 给出有明确语义的分数范围
+    # Component 2: Score Range Regularization (最终优化版：统一约束)
+    # 目标：防止分数漂移到极端值，同时最大化 Critic 的评分自由度
     # 
-    # 设计理念：
-    # - Teacher 应该得到正分数（高质量答案）：目标范围 [5, 10]
-    # - Student 允许更大范围（质量不确定）：目标范围 [2, 10]  # 从 [0, 10] 提高到 [2, 10]
+    # 设计理念（2026-02-21 最终优化）：
+    # - Teacher 和 Student 统一限制在 [0, 10] 范围
+    #   理由 1：公平对待，避免隐含偏见
+    #   理由 2：符合通用评分系统直觉（0=最差, 10=最好）
+    #   理由 3：当前数据显示分数自然在 4-9 范围，不需要非对称约束
+    #   理由 4：让 Critic 自由学习真实的质量评估
     # - 使用软约束（正则化），不是硬截断
-    # - 通过梯度逐步引导分数到目标范围
+    # - 最小化人为干预，信任模型的学习能力
     # 
-    # 分数语义：
-    # Teacher: 5=及格, 6=良好, 7-8=优秀, 9-10=完美
-    # Student: 2=较差, 4=中等, 6=良好, 8-10=优秀
+    # 分数语义（自然学习）：
+    # 0-10 分制：0=完全错误, 5=中等水平, 10=完美答案
+    # Teacher 和 Student 都在此范围内，由 Critic 根据实际质量评分
     
-    # Teacher 约束：鼓励在 [5, 10] 范围
-    TEACHER_SCORE_LOW = 5.0
-    TEACHER_SCORE_HIGH = 10.0
-    teacher_low_penalty = torch.nn.functional.relu(TEACHER_SCORE_LOW - teacher_score_raw)
-    teacher_high_penalty = torch.nn.functional.relu(teacher_score_raw - TEACHER_SCORE_HIGH)
+    # 统一的分数范围约束
+    SCORE_LOW = 0.0
+    SCORE_HIGH = 10.0
     
-    # Student 约束：鼓励在 [2, 10] 范围（从 [0, 10] 提高）
-    # 理由：避免长期负分数，确保 GAD 阶段有正向 reward 信号
-    STUDENT_SCORE_LOW = 2.0  # 从 0.0 提高到 2.0
-    STUDENT_SCORE_HIGH = 10.0
-    student_low_penalty = torch.nn.functional.relu(STUDENT_SCORE_LOW - student_score_raw)
-    student_high_penalty = torch.nn.functional.relu(student_score_raw - STUDENT_SCORE_HIGH)
+    # Teacher 约束：[0, 10]
+    teacher_low_penalty = torch.nn.functional.relu(SCORE_LOW - teacher_score_raw)
+    teacher_high_penalty = torch.nn.functional.relu(teacher_score_raw - SCORE_HIGH)
+    
+    # Student 约束：[0, 10]
+    student_low_penalty = torch.nn.functional.relu(SCORE_LOW - student_score_raw)
+    student_high_penalty = torch.nn.functional.relu(student_score_raw - SCORE_HIGH)
     
     # 总正则化损失
-    # 权重 0.15：从 0.1 增大到 0.15，加速 Student 分数上升
-    SCORE_REG_WEIGHT = 0.15  # 从 0.1 增大到 0.15
+    # 权重 0.1：适中的约束力，既防止极端值，又不过度干预
+    # 从 0.05 提高到 0.1，因为 0.05 太小导致出现负分数
+    SCORE_REG_WEIGHT = 0.1
     score_reg = SCORE_REG_WEIGHT * (
         teacher_low_penalty.pow(2).mean() +
         teacher_high_penalty.pow(2).mean() +
@@ -1539,10 +1542,13 @@ def compute_discriminator_loss(
     # ==============================
     # 3. 总损失聚合
     # ==============================
-    # 优化 2026-02-05：减小 ranking_loss 权重，让 score_reg 有更大影响
-    # 理由：避免 Warmup 阶段分差过大，影响后续 GAD 训练
-    # 从 3.0 减小到 2.5
-    d_loss = 2.5 * ranking_loss + score_reg
+    # 优化 2026-02-21：平衡 ranking_loss 和 score_reg 的权重
+    # 理由：
+    # 1. ranking_loss 负责区分 Teacher 和 Student
+    # 2. score_reg 负责防止分数漂移到极端值
+    # 3. 需要平衡两者，避免 score_reg 被 ranking_loss 淹没
+    # 从 2.5 减小到 2.0，让 score_reg 有更大影响
+    d_loss = 2.0 * ranking_loss + score_reg
     
     # ==============================
     # 4. 监控指标（简化版）
